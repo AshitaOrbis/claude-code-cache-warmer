@@ -1,5 +1,39 @@
 # Changelog
 
+## v0.3.1 — 2026-06-11
+
+Hardening from a second independent adversarial review (Claude Fable 5, max
+effort; full text in `reviews/fable-5-max-review-2026-06-11.md`). That review
+found 0 P0 / 6 P1 / 17 P2 against v0.3.0; the data-safety core held, but the
+P1s were all real (three empirically confirmed on the dev machine). Fixes:
+
+- **Armed-fork disclosure** (P1-1): README now documents that the fork runs
+  with the live session's permissions (incl. `--dangerously-skip-permissions`);
+  the keepalive is an explicit do-not-act instruction; new
+  `WARM_BYPASS_SESSIONS=0` skips bypass-permission sessions.
+- **Stray-fork recursion** (P1-2): candidates containing the keepalive marker
+  are skipped — a `--fork-session` copy carries the parent's full history and
+  would otherwise pass every gate and get warmed as a phantom session.
+- **Stale clock** (P1-3): the freshness/idle/rate timestamp is recomputed per
+  candidate, not once per run — a multi-warm run no longer mis-ages later
+  sessions into cold warms and false strikes.
+- **Project-dir mapping bug** (P1-4): fork identification uses `dirname` of the
+  live jsonl instead of recomputing the dir from cwd (Claude Code maps `.`→`-`
+  too, so the old computation silently failed for dotted paths).
+- **Flag replication** (P1-5): handle `--model=value` form; fail *closed*
+  (skip + log) on prefix-affecting flags that can't be replicated, instead of
+  paying two full writes to discover the divergence.
+- **Scheduled drift** (P1-6): skip warms whose freshness reference crosses a
+  calendar-day boundary (date-in-prefix divergence); the mismatch blacklist is
+  now a `MISMATCH_COOLDOWN_DAYS` cooldown, not permanent.
+- Plus: real process-exit wait via pane PID (P2-2, the v0.2.1 fix was a no-op);
+  sidechain-aware expected-prefix + usage parsing (P2-3, P2-17); regex-validity
+  and numeric/marker config validation (P2-5, P2-15); unknown-arg rejection
+  (P2-7); dry-run is now side-effect-free (P2-8); `stat` TOCTOU guard (P2-10);
+  exact-match (`=`) tmux targeting + pinned window names (P2-11); wrapper-launch
+  process discovery (P2-12); measure-ttl.py deleted-file + fork-exclusion
+  guards (P2-14). README: Bash 4.4+, linger note, drift/MCP caveats.
+
 ## v0.3.0 — 2026-06-11
 
 - Warm results are now classified against the LIVE session's expected prefix

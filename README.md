@@ -63,8 +63,10 @@ All tested empirically before settling on the fork design:
 ## Requirements
 
 - **GNU/Linux** with **systemd user services** and **tmux** (also assumes
-  `/proc`, GNU `stat`/`ps`, `flock`, Bash 4+). macOS, minimal containers, and
-  BusyBox systems are not supported.
+  `/proc`, GNU `stat`/`ps`/`date`, `flock`, **Bash 4.4+**). macOS, minimal
+  containers, and BusyBox systems are not supported. If you SSH in, detach
+  tmux, and log out, enable `loginctl enable-linger $USER` or the timer stops
+  at logout.
 - **Claude Code** (developed against v2.1.173) and **python3**
 - The 1-hour extended cache TTL enabled in **both** places:
   - your shell profile (`export ENABLE_PROMPT_CACHING_1H=1`) for live sessions
@@ -141,13 +143,35 @@ and every spend is visible as a RESULT line. Use `EXCLUDE_SIDS` /
 - `config` is **sourced as shell code** — keep it `chmod 600` and treat it
   like a script.
 
+## Armed forks (read this before enabling)
+
+The fork is **not an inert sandbox** — it is the same Claude Code agent, with
+the same tools, MCP servers, and permission mode as your live session, resumed
+in the same working directory. To reproduce the cache prefix it *must* match
+the live configuration, so if your live session runs
+`--dangerously-skip-permissions`, **so does the fork**.
+
+That means: in bypass mode, if the model chooses to act on the keepalive
+instead of just replying `ok` (rare, but this rolls the dice every ~50 minutes
+per idle session, unattended), its tool calls execute with no approval gate,
+in your real working tree, from a hidden tmux window you never see. The
+keepalive text explicitly instructs the fork to take no action, and the fork
+is killed as soon as it replies — but this is a real risk surface, not a
+hypothetical.
+
+Mitigations in the tool: the keepalive is a do-not-act instruction; the reply
+loop kills the fork window promptly; `WARM_BYPASS_SESSIONS=0` skips
+bypass-permission sessions entirely (at the cost of not warming them). If you
+run bypass sessions and aren't comfortable with the above, set that to `0`.
+
 ## Cost model (be deliberate about this)
 
 A successful warm costs ~0.1× of the session's prefix in cache-read tokens
 plus a tiny completion, charged against your plan quota. Warming a 500k-token
 session for the full 4-hour idle window ≈ 4 warms ≈ ~200k token-equivalents.
 That's the premium you pay for the *option* of a cheap, fast resume. A
-mismatch costs one cache write on the fork's prefix before containment. If you
+mismatch costs up to two full cache writes on the fork's prefix before the
+two-strike blacklist trips (then a `MISMATCH_COOLDOWN_DAYS` cooldown). If you
 rarely return to sessions within a few hours, lower `MAX_USER_IDLE_MIN` — or
 don't run this tool.
 
@@ -175,6 +199,17 @@ Disable: set `ENABLED=0` in `config` (soft), or
 - Forks work only in directories you have already trusted in Claude Code.
 - Not for untrusted multi-user machines: the warmer reads process lists and
   session logs, and types into tmux panes it owns.
+- **Deterministic prefix drift skips, not warms**: if the cache-freshness
+  reference and now fall on different calendar days, or the live session was
+  launched with a prefix-affecting flag the warmer can't replicate
+  (`--append-system-prompt`, `--mcp-config`, `--settings`, `--add-dir`, …),
+  the session is *skipped* (logged) rather than warmed-and-mismatched. A
+  Claude Code auto-update or a CLAUDE.md/MCP edit between the live session's
+  last turn and the warm can still cause a one-off mismatch; that's contained
+  by the two-strike cooldown blacklist.
+- Each warm boots a full Claude Code instance, which starts your configured
+  MCP servers (their startup side effects fire, headless) and may make an
+  auxiliary title-generation call. Factor that into "cost nothing" expectations.
 - The honest upstream fix would be a first-class Claude Code command that
   refreshes a session's cache without a transcript entry. Until then, this is
   a careful workaround, not a guarantee.

@@ -24,6 +24,17 @@ MAX_USER_IDLE_MIN=240
 # the warm window already implies ~45 min spacing).
 RATELIMIT_MIN=30
 
+# A session that mismatches twice is blacklisted for this many days, then
+# retried (mismatch causes like a binary update or CLAUDE.md edit are transient).
+MISMATCH_COOLDOWN_DAYS=3
+
+# Warm sessions launched with --dangerously-skip-permissions? The fork is a
+# fully-armed agent in the live cwd; in bypass mode it could act on the
+# keepalive with no approval gate (see README "Armed forks"). Set 0 to skip
+# bypass-permission sessions entirely. Default 1 — the keepalive instructs the
+# fork to take no action, and the prefix must match (so bypass is replicated).
+WARM_BYPASS_SESSIONS=1
+
 # Require at least this many REAL user messages before a session qualifies.
 # Filters one-shot `claude -p` cron sessions that share project dirs with
 # interactive TUI sessions.

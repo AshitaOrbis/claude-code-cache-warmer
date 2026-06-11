@@ -31,17 +31,31 @@ BUCKETS = [
 MIN_PREFIX_TOKENS = 20_000  # ignore tiny turns; cache effects are noise there
 
 
+def _safe_mtime(p):
+    try:
+        return os.path.getmtime(p)
+    except OSError:
+        return 0.0
+
+
 def collect(max_files: int):
     rows = []
     files = sorted(
         glob.glob(os.path.expanduser("~/.claude/projects/*/*.jsonl")),
-        key=os.path.getmtime,
+        key=_safe_mtime,        # files can be deleted between glob and sort
         reverse=True,
     )[:max_files]
     for path in files:
         prev_ts = None
         try:
             with open(path) as fh:
+                head = fh.read(4096)
+                # Exclude cache-warmer fork transcripts: once the warmer runs,
+                # they (and re-armed live sessions) would inflate the apparent
+                # TTL. Measure with the warmer DISABLED for a true reading.
+                if "[cache-warmer keepalive]" in head:
+                    continue
+                fh.seek(0)
                 for line in fh:
                     try:
                         rec = json.loads(line)

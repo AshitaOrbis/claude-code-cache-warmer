@@ -46,19 +46,41 @@ WARM_MAX_AGE=58
 MAX_USER_IDLE_MIN=240
 MIN_USER_MSGS=2
 RATELIMIT_MIN=30
+MISMATCH_COOLDOWN_DAYS=3   # blacklist a repeatedly-mismatching sid for this long, then retry
+WARM_BYPASS_SESSIONS=1     # warm sessions launched with --dangerously-skip-permissions? (see README "Armed forks")
 EXCLUDE_SIDS=''
 INCLUDE_ONLY_SIDS=''
-KEEPALIVE_TEXT='[cache-warmer keepalive] No action needed — reply with only: ok'
+KEEPALIVE_TEXT='[cache-warmer keepalive] Automated cache keepalive. Do NOT take any action, run any tool, or continue prior work. Reply with exactly: ok'
 FORK_SPAWN_TIMEOUT=180   # seconds to wait for the fork TUI's input prompt (huge sessions take >60s to restore)
 FORK_REPLY_TIMEOUT=120   # seconds to wait for the fork's keepalive turn
 FORK_RETENTION_DAYS=7    # archived fork transcripts older than this are pruned
 # shellcheck disable=SC1090
 [[ -f $CONFIG_FILE ]] && source "$CONFIG_FILE"
 
+# Validate config: numeric knobs must be integers; regexes must compile; the
+# keepalive must be single-line and carry the marker (used to exclude forks).
+for _n in WARM_MIN_AGE WARM_MAX_AGE MAX_USER_IDLE_MIN MIN_USER_MSGS RATELIMIT_MIN \
+          MISMATCH_COOLDOWN_DAYS FORK_SPAWN_TIMEOUT FORK_REPLY_TIMEOUT FORK_RETENTION_DAYS; do
+  [[ ${!_n} =~ ^[0-9]+$ ]] || { echo "config error: $_n must be an integer (got '${!_n}')" >&2; exit 2; }
+done
+for _re in EXCLUDE_SIDS INCLUDE_ONLY_SIDS; do
+  # A malformed regex makes =~ return status 2; a valid regex that simply
+  # doesn't match returns 1. Only status 2 is a config error. The `|| _st=$?`
+  # both captures the status and keeps set -e from firing on the no-match case.
+  if [[ -n ${!_re} ]]; then
+    _st=0; [[ "x" =~ ${!_re} ]] || _st=$?
+    (( _st >= 2 )) && { echo "config error: $_re is not a valid regex" >&2; exit 2; }
+  fi
+done
+[[ $KEEPALIVE_TEXT == *$'\n'* ]] && { echo "config error: KEEPALIVE_TEXT must be single-line" >&2; exit 2; }
+[[ $KEEPALIVE_TEXT == *'[cache-warmer keepalive]'* ]] || { echo "config error: KEEPALIVE_TEXT must contain the '[cache-warmer keepalive]' marker (fork-exclusion depends on it)" >&2; exit 2; }
+
 DRY_RUN=0
 case "${1:-}" in
   --dry-run) DRY_RUN=1 ;;
   --help|-h) sed -n '2,27p' "$0"; exit 0 ;;
+  "") ;;
+  *) echo "unknown argument: $1 (use --dry-run or --help)" >&2; exit 2 ;;
 esac
 
 log() {
@@ -167,13 +189,21 @@ try:
                 if nonce in (text or ""):
                     seen_nonce = True
             else:
-                if rec.get("type") == "assistant":
-                    u = (rec.get("message") or {}).get("usage") or {}
-                    break
+                # First real assistant turn after the nonce with usable usage.
+                # Skip sidechain turns and usage-less records (e.g. an error
+                # turn before a successful retry).
+                if rec.get("type") == "assistant" and not rec.get("isSidechain"):
+                    cand = (rec.get("message") or {}).get("usage") or {}
+                    if any(cand.get(k) for k in ("cache_read_input_tokens",
+                                                 "cache_creation_input_tokens", "input_tokens")):
+                        u = cand
+                        break
 except Exception:
     pass
 if u:
-    print(u.get("cache_read_input_tokens", 0), u.get("cache_creation_input_tokens", 0), u.get("input_tokens", 0))
+    print(u.get("cache_read_input_tokens", 0) or 0,
+          u.get("cache_creation_input_tokens", 0) or 0,
+          u.get("input_tokens", 0) or 0)
 PY
 }
 
@@ -190,7 +220,9 @@ try:
                 rec = json.loads(line)
             except Exception:
                 continue
-            if rec.get("type") == "assistant":
+            # Skip subagent (sidechain) turns: they share the session file but
+            # carry small per-subagent contexts that would skew the baseline.
+            if rec.get("type") == "assistant" and not rec.get("isSidechain"):
                 u = (rec.get("message") or {}).get("usage") or {}
                 t = (u.get("cache_read_input_tokens", 0) or 0) + \
                     (u.get("cache_creation_input_tokens", 0) or 0) + \
@@ -203,17 +235,29 @@ print(exp)
 PY
 }
 
+# Flags that change the prompt prefix but that we do NOT replicate. If a live
+# session was launched with any of these, the fork's prefix would diverge and
+# the warm would pay a full cache write to discover it — so we skip instead
+# (see prefix_unreplicable). --model and --permission-mode ARE replicated.
+PREFIX_AFFECTING_UNREPLICATED='--append-system-prompt|--system-prompt|--settings|--add-dir|--agents?|--mcp-config|--strict-mcp-config|--allowed-?[Tt]ools|--disallowed-?[Tt]ools|--betas?'
+
+# True if the live args contain a prefix-affecting flag we can't reproduce.
+prefix_unreplicable() {
+  [[ $1 =~ $PREFIX_AFFECTING_UNREPLICATED ]]
+}
+
 # Replicate only prefix-relevant, value-validated flags from the live
 # process's cmdline. The fork's system prompt must reconstruct identically or
-# the cache misses; permission mode is part of that. Deliberately NOT
-# replicated: --remote-control, --resume/--continue (we supply our own).
+# the cache misses; permission mode is part of that. Handles both space and
+# '=' flag forms. Deliberately NOT replicated: --remote-control,
+# --resume/--continue (we supply our own).
 replicated_flags() {
   local args=$1 out=""
   [[ $args == *"--dangerously-skip-permissions"* ]] && out+=" --dangerously-skip-permissions"
-  if [[ $args =~ --model[[:space:]]+([^[:space:]]+) ]] && [[ ${BASH_REMATCH[1]} =~ $SAFE_VALUE_RE ]]; then
+  if [[ $args =~ --model[[:space:]=]+([^[:space:]]+) ]] && [[ ${BASH_REMATCH[1]} =~ $SAFE_VALUE_RE ]]; then
     out+=" --model ${BASH_REMATCH[1]}"
   fi
-  if [[ $args =~ --permission-mode[[:space:]]+([^[:space:]]+) ]] && [[ ${BASH_REMATCH[1]} =~ $SAFE_VALUE_RE ]]; then
+  if [[ $args =~ --permission-mode[[:space:]=]+([^[:space:]]+) ]] && [[ ${BASH_REMATCH[1]} =~ $SAFE_VALUE_RE ]]; then
     out+=" --permission-mode ${BASH_REMATCH[1]}"
   fi
   echo "$out"
@@ -223,8 +267,13 @@ replicated_flags() {
 # on verified warm, 1 otherwise. Logs RESULT/FAIL lines itself.
 warm_by_fork() {
   local sid=$1 cwd=$2 live_args=$3 live_jsonl=$4
-  local project_dir="$HOME/.claude/projects/${cwd//\//-}"
-  local flags win rc=1 nonce spawn_epoch
+  # Derive the project dir from the live jsonl itself — Claude Code mangles
+  # more than just '/' in the cwd→dir mapping (e.g. '.' also becomes '-'), so
+  # recomputing it from cwd is unreliable. The fork's jsonl lands beside the
+  # live one, so dirname is correct by construction.
+  local project_dir
+  project_dir=$(dirname "$live_jsonl")
+  local flags win rc=1 nonce spawn_epoch pane_pid=""
   [[ $sid =~ $UUID_RE ]] || { log "FAIL sid=${sid:0:8}: not a valid session UUID, refusing to fork"; return 1; }
   flags=$(replicated_flags "$live_args")
   nonce=$(cat /proc/sys/kernel/random/uuid 2>/dev/null || date +%s%N)
@@ -237,12 +286,17 @@ warm_by_fork() {
   local spawn_cmd
   spawn_cmd="env -u CLAUDECODE -u CLAUDE_CODE_ENTRYPOINT -u CLAUDE_CODE_SSE_PORT ENABLE_PROMPT_CACHING_1H=1 claude --resume $sid --fork-session$flags"
 
-  if tmux has-session -t "$FORK_TMUX_SESSION" 2>/dev/null; then
-    tmux new-window -d -t "$FORK_TMUX_SESSION" -n "w$$-${sid:0:8}" -c "$cwd" "$spawn_cmd"
+  if tmux has-session -t "=$FORK_TMUX_SESSION" 2>/dev/null; then
+    tmux new-window -d -t "=$FORK_TMUX_SESSION" -n "w$$-${sid:0:8}" -c "$cwd" "$spawn_cmd"
   else
     tmux new-session -d -s "$FORK_TMUX_SESSION" -n "w$$-${sid:0:8}" -c "$cwd" "$spawn_cmd"
   fi
   CURRENT_WIN="$win"
+  # Pin the window name and capture the pane PID so cleanup/exit-wait track the
+  # process, not a name a rename-on config could change out from under us.
+  tmux set-window-option -t "$win" automatic-rename off 2>/dev/null || true
+  tmux set-window-option -t "$win" allow-rename off 2>/dev/null || true
+  pane_pid=$(tmux list-panes -t "$win" -F '#{pane_pid}' 2>/dev/null | head -1 || true)
 
   # Wait for the fork TUI's empty input prompt. Large sessions take minutes
   # to restore; that's fine, the slow path is exactly the valuable one.
@@ -311,14 +365,16 @@ warm_by_fork() {
 
   tmux kill-window -t "$win" 2>/dev/null || true
   CURRENT_WIN=""
-  # Wait for the fork process to fully exit — it can flush a final write to
-  # its jsonl moments after the window dies, which would re-create the file
-  # after we archive it.
-  local dead_wait=0
-  while (( dead_wait < 10 )); do
-    tmux list-panes -t "$win" >/dev/null 2>&1 || break
-    sleep 1; dead_wait=$((dead_wait+1))
-  done
+  # Wait for the fork PROCESS to fully exit — killing the window is async, and
+  # claude flushes a final write to its jsonl moments after SIGHUP, which would
+  # re-create the file after we archive it. Poll the actual pane PID (checking
+  # the window name is a no-op: kill-window destroys it on the first probe).
+  if [[ -n $pane_pid ]]; then
+    local dead_wait=0
+    while (( dead_wait < 15 )) && kill -0 "$pane_pid" 2>/dev/null; do
+      sleep 1; dead_wait=$((dead_wait+1))
+    done
+  fi
   sleep 1
 
   local mismatch_file="$STATE_DIR/${sid}.mismatch_count"
@@ -392,27 +448,31 @@ warm_by_fork() {
   return $rc
 }
 
-# Prune old archived fork transcripts (ours only).
-find "$FORK_ARCHIVE_DIR" -maxdepth 1 -name '*.jsonl' -mtime +"$FORK_RETENTION_DAYS" -delete 2>/dev/null || true
+# Side-effecting maintenance — skipped in dry-run (which must observe only).
+if (( ! DRY_RUN )); then
+  # Prune old archived fork transcripts (ours only).
+  find "$FORK_ARCHIVE_DIR" -maxdepth 1 -name '*.jsonl' -mtime +"$FORK_RETENTION_DAYS" -delete 2>/dev/null || true
 
-# Clean up an orphaned fork session from a crashed run — but only if every
-# window matches our naming pattern; never kill a session a user repurposed.
-if tmux has-session -t "$FORK_TMUX_SESSION" 2>/dev/null; then
-  win_names=$(tmux list-windows -t "$FORK_TMUX_SESSION" -F '#{window_name}' 2>/dev/null || true)
-  if [[ -z $win_names ]] || ! printf '%s\n' "$win_names" | grep -qvE '^w[0-9]+-[0-9a-f]{8}$'; then
-    log "note: removing leftover $FORK_TMUX_SESSION tmux session"
-    tmux kill-session -t "$FORK_TMUX_SESSION" 2>/dev/null || true
-  else
-    log "note: $FORK_TMUX_SESSION exists with unexpected windows — leaving it alone"
+  # Clean up an orphaned fork session from a crashed run — but only if every
+  # window matches our naming pattern; never kill a session a user repurposed.
+  if tmux has-session -t "=$FORK_TMUX_SESSION" 2>/dev/null; then
+    win_names=$(tmux list-windows -t "=$FORK_TMUX_SESSION" -F '#{window_name}' 2>/dev/null || true)
+    if [[ -z $win_names ]] || ! printf '%s\n' "$win_names" | grep -qvE '^w[0-9]+-[0-9a-f]{8}$'; then
+      log "note: removing leftover $FORK_TMUX_SESSION tmux session"
+      tmux kill-session -t "=$FORK_TMUX_SESSION" 2>/dev/null || true
+    else
+      log "note: $FORK_TMUX_SESSION exists with unexpected windows — leaving it alone"
+    fi
   fi
 fi
-
-NOW=$(date +%s)
 
 # Evaluate one candidate session; warm it if due. Args: jsonl, cwd, live_args.
 declare -A SEEN_SID
 process_candidate() {
   local jsonl=$1 cwd=$2 live_args=$3
+  # Recompute now — a multi-warm run can take many minutes, and a stale `now`
+  # would mis-age later candidates (warming a cold session, false strikes).
+  local now; now=$(date +%s)
   [[ -f $jsonl ]] || return 0
   local sid
   sid=$(basename "$jsonl" .jsonl)
@@ -427,26 +487,64 @@ process_candidate() {
   if [[ -n $EXCLUDE_SIDS && $sid =~ $EXCLUDE_SIDS ]]; then
     return 0
   fi
-  if [[ -f "$STATE_DIR/${sid}.fork_mismatch" ]]; then
-    return 0   # repeated measured prefix mismatch; warming wastes a full cache write
+  # Repeated measured prefix mismatch → cooldown (not permanent): many
+  # mismatch causes are transient (binary update, CLAUDE.md churn, a one-off
+  # cold cache), so a session that mismatched days ago deserves a retry.
+  local bl="$STATE_DIR/${sid}.fork_mismatch"
+  if [[ -f $bl ]]; then
+    local bl_age=$(( (now - $(stat -c %Y "$bl" 2>/dev/null || echo "$now")) / 86400 ))
+    if (( bl_age < MISMATCH_COOLDOWN_DAYS )); then
+      return 0
+    fi
+    rm -f "$bl" "$STATE_DIR/${sid}.mismatch_count"   # cooldown elapsed; give it another chance
+  fi
+
+  # Never warm a fork artifact: --fork-session copies the parent's full history
+  # (including our keepalive marker) into a new file that would otherwise pass
+  # every gate and get warmed as if it were a live session.
+  if grep -qaF '[cache-warmer keepalive]' "$jsonl" 2>/dev/null; then
+    return 0
+  fi
+
+  # Fail closed on prefix-affecting flags we can't reproduce — replaying them
+  # wrong pays a full cache write per attempt. Better to skip and say so.
+  if prefix_unreplicable "$live_args"; then
+    log "skip sid=${sid:0:8}: live args use a prefix-affecting flag the warmer can't replicate (would mismatch)"
+    return 0
+  fi
+
+  # The fork is a fully-armed Claude agent in the live session's cwd; with
+  # --dangerously-skip-permissions it could act on the keepalive without an
+  # approval gate. Opt-out gate (default warms them — the prefix must match,
+  # so bypass mode has to be replicated; see README "Armed forks").
+  if [[ $WARM_BYPASS_SESSIONS != 1 && $live_args == *"--dangerously-skip-permissions"* ]]; then
+    log "skip sid=${sid:0:8}: session runs --dangerously-skip-permissions and WARM_BYPASS_SESSIONS=0"
+    return 0
   fi
 
   # Cache freshness = most recent of (live API activity, our last SUCCESSFUL
   # fork-warm). Fork warms re-arm the cache without touching the live jsonl,
   # so warm state is tracked separately.
   local mtime last_warm last_attempt fresh age_min
-  mtime=$(stat -c %Y "$jsonl")
+  mtime=$(stat -c %Y "$jsonl" 2>/dev/null) || return 0   # file vanished mid-run
   last_warm=$(read_int_state "$STATE_DIR/${sid}.last_warm")
   last_attempt=$(read_int_state "$STATE_DIR/${sid}.last_attempt")
   fresh=$(( mtime > last_warm ? mtime : last_warm ))
-  age_min=$(( (NOW - fresh) / 60 ))
+  age_min=$(( (now - fresh) / 60 ))
 
   if (( age_min < WARM_MIN_AGE || age_min >= WARM_MAX_AGE )); then
     return 0   # comfortably warm, or past the window (cold) — quiet skip
   fi
+  # Skip if the cache freshness reference is on a different calendar day than
+  # now: the prompt prefix typically embeds the current date, so a fork across
+  # a midnight boundary diverges deterministically (full write + false strike).
+  if [[ $(date -d "@$fresh" +%Y-%m-%d 2>/dev/null) != $(date -d "@$now" +%Y-%m-%d 2>/dev/null) ]]; then
+    log "skip sid=${sid:0:8} age=${age_min}m: warm window crosses a date boundary (prefix would diverge)"
+    return 0
+  fi
   # Rate-limit on ATTEMPTS (not successes) so a failing session can't be
   # hammered, while failures don't fake freshness.
-  if (( NOW - last_attempt < RATELIMIT_MIN * 60 )); then
+  if (( now - last_attempt < RATELIMIT_MIN * 60 )); then
     return 0
   fi
 
@@ -462,7 +560,7 @@ process_candidate() {
     log "skip sid=${sid:0:8} age=${age_min}m: only ${user_count} real user msg(s) (< ${MIN_USER_MSGS}; likely headless run)"
     return 0
   fi
-  user_idle_min=$(( (NOW - user_epoch) / 60 ))
+  user_idle_min=$(( (now - user_epoch) / 60 ))
   if (( user_idle_min > MAX_USER_IDLE_MIN )); then
     log "skip sid=${sid:0:8} age=${age_min}m user-idle=${user_idle_min}m > ${MAX_USER_IDLE_MIN}m: letting cache lapse"
     return 0
@@ -482,7 +580,9 @@ process_candidate() {
 # --resume sids). Forks and -p/--print processes are never candidates.
 declare -A DIR_CWD DIR_ARGS RESUME_SID_ARGS RESUME_SID_CWD
 while IFS=$'\t' read -r pid tty comm args; do
-  [[ $comm == claude ]] || continue
+  # Match both direct `claude` and wrapper-launched instances (npx/node execing
+  # the CLI) whose argv still names the claude entrypoint.
+  [[ $comm == claude || $args == *"claude"* ]] || continue
   [[ $tty != "?" ]] || continue
   case " $args " in
     *" -p "*|*" --print "*) continue ;;
