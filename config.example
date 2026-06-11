@@ -1,0 +1,45 @@
+# cache-warmer configuration
+# Copy to `config` next to cache-warmer.sh and edit. Sourced on every run.
+
+# Master switch. 0 = script exits immediately (timer keeps firing but does nothing).
+ENABLED=1
+
+# Warm window: fork-warm a session only when its cache freshness (last live API
+# activity OR last fork-warm, whichever is newer) is between these ages
+# (minutes). With the 1-hour extended TTL (ENABLE_PROMPT_CACHING_1H=1), the
+# expiry cliff sits around ~55-65 min, so 45-58 refreshes safely before expiry
+# and never pays a full cache re-write on an already-cold session. Verify your
+# own cliff with measure-ttl.py.
+WARM_MIN_AGE=45
+WARM_MAX_AGE=58
+
+# Stop warming a session once the last REAL user message (not tool results,
+# not keepalives) is older than this (minutes). Caps waste at ~4-5 warms
+# after the user walks away.
+MAX_USER_IDLE_MIN=240
+
+# Minimum minutes between warms of the same session (defense in depth;
+# the warm window already implies ~45 min spacing).
+RATELIMIT_MIN=30
+
+# Require at least this many REAL user messages before a session qualifies.
+# Filters one-shot `claude -p` cron sessions that share project dirs with
+# interactive TUI sessions.
+MIN_USER_MSGS=2
+
+# Extended-regex of session IDs to never warm (empty = none).
+# Example: EXCLUDE_SIDS='^(3ed06009|a87a9b6b)'
+EXCLUDE_SIDS=''
+
+# Extended-regex allowlist: if non-empty, ONLY matching session IDs are warmed.
+# Used for controlled testing. Empty = all candidates.
+INCLUDE_ONLY_SIDS=''
+
+# Keepalive text typed into the DISPOSABLE FORK (never the live session).
+# The "[cache-warmer keepalive]" marker is how the user-activity scan excludes
+# keepalives — keep it if you edit this.
+KEEPALIVE_TEXT='[cache-warmer keepalive] No action needed — reply with only: ok'
+
+# Fork lifecycle timeouts (seconds).
+FORK_SPAWN_TIMEOUT=180
+FORK_REPLY_TIMEOUT=120

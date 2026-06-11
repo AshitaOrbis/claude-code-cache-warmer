@@ -1,0 +1,67 @@
+#!/usr/bin/env bash
+# Install (or remove) the cache-warmer systemd user timer.
+#
+#   ./install.sh             # install + enable timer (every 10 min)
+#   ./install.sh --uninstall # stop + remove units (repo files untouched)
+
+set -euo pipefail
+
+REPO_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+UNIT_DIR="$HOME/.config/systemd/user"
+
+if [[ ${1:-} == --uninstall ]]; then
+  systemctl --user disable --now cache-warmer.timer 2>/dev/null || true
+  rm -f "$UNIT_DIR/cache-warmer.service" "$UNIT_DIR/cache-warmer.timer"
+  systemctl --user daemon-reload
+  echo "cache-warmer timer removed."
+  exit 0
+fi
+
+for dep in tmux python3 claude; do
+  command -v "$dep" >/dev/null || { echo "ERROR: '$dep' not found in PATH" >&2; exit 1; }
+done
+
+if [[ ! -f "$REPO_DIR/config" ]]; then
+  cp "$REPO_DIR/config.example" "$REPO_DIR/config"
+  echo "Created $REPO_DIR/config from config.example (ENABLED=1 by default — edit to tune)."
+fi
+
+mkdir -p "$UNIT_DIR"
+cat > "$UNIT_DIR/cache-warmer.service" << EOF
+[Unit]
+Description=Claude Code prompt-cache warmer (fork-based keepalive before cache expiry)
+After=default.target
+
+[Service]
+Type=oneshot
+ExecStart=$REPO_DIR/cache-warmer.sh
+Nice=10
+IOSchedulingClass=best-effort
+IOSchedulingPriority=7
+
+[Install]
+WantedBy=default.target
+EOF
+
+cat > "$UNIT_DIR/cache-warmer.timer" << 'EOF'
+[Unit]
+Description=Run cache-warmer every 10 minutes
+
+[Timer]
+OnBootSec=5min
+OnUnitActiveSec=10min
+AccuracySec=1min
+
+[Install]
+WantedBy=timers.target
+EOF
+
+systemctl --user daemon-reload
+systemctl --user enable --now cache-warmer.timer
+echo "cache-warmer installed and running (every 10 min)."
+echo "  log:     tail -f ~/.claude/logs/cache-warmer.log"
+echo "  dry run: $REPO_DIR/cache-warmer.sh --dry-run"
+echo "  disable: systemctl --user disable --now cache-warmer.timer"
+echo
+echo "Reminder: the 1-hour cache TTL requires ENABLE_PROMPT_CACHING_1H=1 in the"
+echo "shell that launches your Claude Code sessions (see README)."
