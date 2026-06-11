@@ -2,15 +2,16 @@
 # Keep long Claude Code contexts warm in the Anthropic prompt cache — WITHOUT
 # touching the live sessions. For each idle session nearing cache expiry,
 # spawn a disposable FORK (`claude --resume <sid> --fork-session`) in a hidden
-# tmux window, send a keepalive there, then discard the fork. The fork's API
-# request carries the identical prefix, so reading it re-arms the live
-# session's cache TTL; the live session's transcript is never modified
-# (verified byte-identical, 2026-06-11).
+# tmux window, send a nonce-tagged keepalive there, verify the cache hit from
+# the fork's own usage record, then archive the fork. The fork's API request
+# carries the live session's prefix, so reading it re-arms the cache TTL; the
+# live session's transcript is never modified (observed byte-identical on
+# Claude Code v2.1.173, 2026-06-11).
 #
-# Designed for the 1-hour extended prompt-cache TTL (set
-# ENABLE_PROMPT_CACHING_1H=1 in the shell that launches your Claude sessions;
-# Claude Code v2.1.108+). Measure your own effective TTL with measure-ttl.py
-# and tune WARM_MIN_AGE/WARM_MAX_AGE accordingly. See README.md.
+# Designed for the 1-hour extended prompt-cache TTL. The fork environment
+# sets ENABLE_PROMPT_CACHING_1H=1 explicitly; your live sessions need it too
+# (shell profile). Measure your effective TTL with measure-ttl.py and tune
+# WARM_MIN_AGE/WARM_MAX_AGE accordingly. See README.md.
 #
 # Candidates: every session jsonl in the project dirs of currently-running
 # Claude TUI processes, gated by warm window, ≥MIN_USER_MSGS real user
@@ -21,7 +22,9 @@
 #   cache-warmer.sh --dry-run  # log decisions, spawn nothing
 #
 # Every warm logs a RESULT line with the measured cache_read tokens — the
-# direct evidence the warm worked (cache_read ≈ full prefix = success).
+# evidence receipt for that warm (cache_read ≈ full request = prefix served
+# from cache). Fork transcripts are archived under ~/.cache/cache-warmer/forks/
+# for audit (7-day retention), never deleted on the spot.
 
 set -euo pipefail
 
@@ -30,8 +33,11 @@ CONFIG_FILE="$SCRIPT_DIR/config"
 LOG_DIR="$HOME/.claude/logs"
 LOG_FILE="$LOG_DIR/cache-warmer.log"
 STATE_DIR="$HOME/.cache/cache-warmer"
-FORK_TMUX_SESSION="cache-warmer-forks"
-mkdir -p "$LOG_DIR" "$STATE_DIR"
+FORK_ARCHIVE_DIR="$STATE_DIR/forks"
+FORK_TMUX_SESSION="cache-warmer-forks-$(id -u)"
+UUID_RE='^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'
+SAFE_VALUE_RE='^[A-Za-z0-9._-]+$'
+mkdir -p "$LOG_DIR" "$STATE_DIR" "$FORK_ARCHIVE_DIR"
 
 # Defaults; config overrides.
 ENABLED=0
@@ -45,19 +51,35 @@ INCLUDE_ONLY_SIDS=''
 KEEPALIVE_TEXT='[cache-warmer keepalive] No action needed — reply with only: ok'
 FORK_SPAWN_TIMEOUT=180   # seconds to wait for the fork TUI's input prompt (huge sessions take >60s to restore)
 FORK_REPLY_TIMEOUT=120   # seconds to wait for the fork's keepalive turn
+FORK_RETENTION_DAYS=7    # archived fork transcripts older than this are pruned
 # shellcheck disable=SC1090
 [[ -f $CONFIG_FILE ]] && source "$CONFIG_FILE"
 
 DRY_RUN=0
 case "${1:-}" in
   --dry-run) DRY_RUN=1 ;;
-  --help|-h) sed -n '2,22p' "$0"; exit 0 ;;
+  --help|-h) sed -n '2,27p' "$0"; exit 0 ;;
 esac
 
 log() {
   local tag=""
   (( DRY_RUN )) && tag=" [dry-run]"
   echo "[$(date '+%Y-%m-%d %H:%M:%S')]${tag} $*" >> "$LOG_FILE"
+}
+
+# Read a state file that must contain an integer; corrupt -> 0.
+read_int_state() {
+  local f=$1 v=0
+  [[ -f $f ]] && v=$(cat "$f" 2>/dev/null || echo 0)
+  [[ $v =~ ^[0-9]+$ ]] || v=0
+  echo "$v"
+}
+
+# Atomic state write.
+write_state() {
+  local f=$1 v=$2 tmp
+  tmp=$(mktemp "$STATE_DIR/.tmp.XXXXXX")
+  printf '%s\n' "$v" > "$tmp" && mv "$tmp" "$f"
 }
 
 if [[ ${ENABLED:-0} != 1 ]]; then
@@ -72,6 +94,14 @@ if ! flock -n 9; then
   exit 0
 fi
 
+# Kill the current fork window if the script dies mid-warm (systemd stop,
+# logout, error) instead of leaving an orphaned Claude process running.
+CURRENT_WIN=""
+cleanup_current_win() {
+  [[ -n $CURRENT_WIN ]] && tmux kill-window -t "$CURRENT_WIN" 2>/dev/null || true
+}
+trap cleanup_current_win EXIT INT TERM HUP
+
 # Last real-user-message epoch + count for a session jsonl. Real = type=user,
 # not a tool result, not meta, not a keepalive. Prints "epoch count".
 user_activity() {
@@ -82,8 +112,6 @@ last, count = None, 0
 try:
     with open(sys.argv[1]) as fh:
         for line in fh:
-            if '"type":"user"' not in line and '"type": "user"' not in line:
-                continue
             try:
                 rec = json.loads(line)
             except Exception:
@@ -100,8 +128,13 @@ try:
             if marker in text:
                 continue
             ts = rec.get("timestamp")
-            if ts:
-                last, count = ts, count + 1
+            if not ts:
+                continue
+            try:
+                datetime.datetime.fromisoformat(ts.replace("Z", "+00:00"))
+            except Exception:
+                continue
+            last, count = ts, count + 1
 except Exception:
     pass
 if last:
@@ -110,38 +143,51 @@ if last:
 PY
 }
 
-# Usage of the LAST assistant message in a fork jsonl: "read creation input".
-fork_last_usage() {
-  python3 - "$1" <<'PY'
+# Usage of the assistant turn that ANSWERS our nonce-tagged keepalive.
+# Prints "read creation input" only when that causal pair exists.
+fork_usage_for_nonce() {
+  python3 - "$1" "$2" <<'PY'
 import json, sys
+path, nonce = sys.argv[1], sys.argv[2]
+seen_nonce = False
 u = None
 try:
-    with open(sys.argv[1]) as fh:
+    with open(path) as fh:
         for line in fh:
             try:
                 rec = json.loads(line)
             except Exception:
                 continue
-            if rec.get("type") == "assistant":
-                u = (rec.get("message") or {}).get("usage") or {}
+            if not seen_nonce:
+                if rec.get("type") != "user" or "toolUseResult" in rec:
+                    continue
+                content = (rec.get("message") or {}).get("content")
+                text = content if isinstance(content, str) else " ".join(
+                    b.get("text", "") for b in (content or []) if isinstance(b, dict))
+                if nonce in (text or ""):
+                    seen_nonce = True
+            else:
+                if rec.get("type") == "assistant":
+                    u = (rec.get("message") or {}).get("usage") or {}
+                    break
 except Exception:
     pass
-if u is not None:
+if u:
     print(u.get("cache_read_input_tokens", 0), u.get("cache_creation_input_tokens", 0), u.get("input_tokens", 0))
 PY
 }
 
-# Replicate only prefix-relevant flags from the live process's cmdline. The
-# fork's system prompt must reconstruct identically or the cache misses; the
-# permission mode is part of that. Deliberately NOT replicated: --remote-control
-# (engages RC needlessly), --resume/--continue (we supply our own).
+# Replicate only prefix-relevant, value-validated flags from the live
+# process's cmdline. The fork's system prompt must reconstruct identically or
+# the cache misses; permission mode is part of that. Deliberately NOT
+# replicated: --remote-control, --resume/--continue (we supply our own).
 replicated_flags() {
   local args=$1 out=""
   [[ $args == *"--dangerously-skip-permissions"* ]] && out+=" --dangerously-skip-permissions"
-  if [[ $args =~ --model[[:space:]]+([^[:space:]]+) ]]; then
+  if [[ $args =~ --model[[:space:]]+([^[:space:]]+) ]] && [[ ${BASH_REMATCH[1]} =~ $SAFE_VALUE_RE ]]; then
     out+=" --model ${BASH_REMATCH[1]}"
   fi
-  if [[ $args =~ --permission-mode[[:space:]]+([^[:space:]]+) ]]; then
+  if [[ $args =~ --permission-mode[[:space:]]+([^[:space:]]+) ]] && [[ ${BASH_REMATCH[1]} =~ $SAFE_VALUE_RE ]]; then
     out+=" --permission-mode ${BASH_REMATCH[1]}"
   fi
   echo "$out"
@@ -152,21 +198,25 @@ replicated_flags() {
 warm_by_fork() {
   local sid=$1 cwd=$2 live_args=$3
   local project_dir="$HOME/.claude/projects/${cwd//\//-}"
-  local flags win rc=1
+  local flags win rc=1 nonce spawn_epoch
+  [[ $sid =~ $UUID_RE ]] || { log "FAIL sid=${sid:0:8}: not a valid session UUID, refusing to fork"; return 1; }
   flags=$(replicated_flags "$live_args")
+  nonce=$(cat /proc/sys/kernel/random/uuid 2>/dev/null || date +%s%N)
+  local keepalive="$KEEPALIVE_TEXT [run=${nonce}]"
   win="$FORK_TMUX_SESSION:w$$-${sid:0:8}"
+  spawn_epoch=$(date +%s)
 
-  # Snapshot existing jsonls so the fork's new file is identifiable.
-  local before_list
-  before_list=$(ls -1 "$project_dir"/*.jsonl 2>/dev/null || true)
+  # The fork must request the same cache TTL as the live session. systemd
+  # user services do not source shell profiles, so set it explicitly here.
+  local spawn_cmd
+  spawn_cmd="env -u CLAUDECODE -u CLAUDE_CODE_ENTRYPOINT -u CLAUDE_CODE_SSE_PORT ENABLE_PROMPT_CACHING_1H=1 claude --resume $sid --fork-session$flags"
 
   if tmux has-session -t "$FORK_TMUX_SESSION" 2>/dev/null; then
-    tmux new-window -d -t "$FORK_TMUX_SESSION" -n "w$$-${sid:0:8}" -c "$cwd" \
-      "env -u CLAUDECODE -u CLAUDE_CODE_ENTRYPOINT -u CLAUDE_CODE_SSE_PORT claude --resume $sid --fork-session$flags"
+    tmux new-window -d -t "$FORK_TMUX_SESSION" -n "w$$-${sid:0:8}" -c "$cwd" "$spawn_cmd"
   else
-    tmux new-session -d -s "$FORK_TMUX_SESSION" -n "w$$-${sid:0:8}" -c "$cwd" \
-      "env -u CLAUDECODE -u CLAUDE_CODE_ENTRYPOINT -u CLAUDE_CODE_SSE_PORT claude --resume $sid --fork-session$flags"
+    tmux new-session -d -s "$FORK_TMUX_SESSION" -n "w$$-${sid:0:8}" -c "$cwd" "$spawn_cmd"
   fi
+  CURRENT_WIN="$win"
 
   # Wait for the fork TUI's empty input prompt. Large sessions take minutes
   # to restore; that's fine, the slow path is exactly the valuable one.
@@ -176,10 +226,13 @@ warm_by_fork() {
     pane_txt=$(tmux capture-pane -t "$win" -p 2>/dev/null || true)
     # NB: the empty input line is "❯" + U+00A0 (no-break space), which
     # [[:space:]] does not match — include the literal NBSP in the bracket.
-    if printf '%s\n' "$pane_txt" | grep -qE $'^❯[ \t\u00a0]*$'; then ready=1; break; fi
-    # auto-accept the folder-trust dialog if it appears
+    if printf '%s\n' "$pane_txt" | grep -qE $'^❯[ \t ]*$'; then ready=1; break; fi
+    # A folder-trust prompt is a security decision — never auto-accept it.
     if printf '%s\n' "$pane_txt" | grep -q "trust this folder"; then
-      tmux send-keys -t "$win" Enter 2>/dev/null || true
+      log "FAIL sid=${sid:0:8}: folder-trust prompt appeared for $cwd — trust the directory manually in Claude Code first"
+      tmux kill-window -t "$win" 2>/dev/null || true
+      CURRENT_WIN=""
+      return 1
     fi
   done
   if (( ! ready )); then
@@ -187,58 +240,113 @@ warm_by_fork() {
     tail_snip=$(printf '%s\n' "$pane_txt" | grep -vE '^[[:space:]]*$' | tail -2 | tr '\n' '|' | head -c 160)
     log "FAIL sid=${sid:0:8}: fork TUI not ready after ${FORK_SPAWN_TIMEOUT}s; pane tail: ${tail_snip:-empty}"
     tmux kill-window -t "$win" 2>/dev/null || true
+    CURRENT_WIN=""
     return 1
   fi
 
-  # Verify-then-commit the keepalive into OUR fork pane.
-  tmux send-keys -t "$win" -l "$KEEPALIVE_TEXT"
+  # Verify-then-commit the keepalive into OUR fork pane: the text must land
+  # intact on the input line (the LAST ❯-line) before Enter is pressed.
+  tmux send-keys -t "$win" -l "$keepalive"
   sleep 0.5
-  if ! tmux capture-pane -t "$win" -p 2>/dev/null | grep -qF 'cache-warmer keepalive'; then
-    log "FAIL sid=${sid:0:8}: keepalive text did not land in fork input box"
+  local input_line
+  input_line=$(tmux capture-pane -t "$win" -p 2>/dev/null | grep -E '^❯' | tail -1 || true)
+  if ! printf '%s\n' "$input_line" | grep -qF "run=${nonce}"; then
+    log "FAIL sid=${sid:0:8}: keepalive text did not land on the fork input line"
+    tmux send-keys -t "$win" Escape 2>/dev/null || true
     tmux kill-window -t "$win" 2>/dev/null || true
+    CURRENT_WIN=""
     return 1
   fi
   tmux send-keys -t "$win" Enter
 
-  # Identify the fork jsonl (new file in the project dir) and await its reply.
+  # Identify the fork jsonl by CONTENT: exactly one file in the project dir,
+  # created/modified after spawn, containing our nonce. Directory-diff
+  # heuristics can misidentify a real user session — never trust them.
   waited=0
-  local fork_jsonl="" usage=""
+  local fork_jsonl="" usage="" matches match_count
   while (( waited < FORK_REPLY_TIMEOUT )); do
     sleep 5; waited=$((waited+5))
     if [[ -z $fork_jsonl ]]; then
-      fork_jsonl=$(comm -13 <(printf '%s\n' "$before_list" | sort) \
-                            <(ls -1 "$project_dir"/*.jsonl 2>/dev/null | sort) | head -1 || true)
+      matches=$(find "$project_dir" -maxdepth 1 -name '*.jsonl' -newermt "@$spawn_epoch" \
+                  -exec grep -l -F "run=${nonce}" {} + 2>/dev/null || true)
+      match_count=$(printf '%s\n' "$matches" | grep -c . || true)
+      if [[ $match_count -eq 1 ]]; then
+        fork_jsonl=$matches
+      fi
     fi
     if [[ -n $fork_jsonl && -f $fork_jsonl ]]; then
-      usage=$(fork_last_usage "$fork_jsonl" || true)
+      usage=$(fork_usage_for_nonce "$fork_jsonl" "$nonce" || true)
       [[ -n $usage ]] && break
     fi
   done
 
   tmux kill-window -t "$win" 2>/dev/null || true
+  CURRENT_WIN=""
 
+  local mismatch_file="$STATE_DIR/${sid}.mismatch_count"
   if [[ -z $usage ]]; then
-    log "FAIL sid=${sid:0:8}: no fork reply within ${FORK_REPLY_TIMEOUT}s (fork_jsonl=${fork_jsonl:-none})"
+    log "FAIL sid=${sid:0:8}: no nonce-matched fork reply within ${FORK_REPLY_TIMEOUT}s (fork_jsonl=${fork_jsonl:-unidentified})"
   else
     local c_read c_create c_in total
     read -r c_read c_create c_in <<< "$usage"
     total=$(( c_read + c_create + c_in ))
     if (( total > 0 && c_read * 2 >= total )); then
-      log "RESULT sid=${sid:0:8} WARMED cache_read=$c_read cache_creation=$c_create (prefix refreshed)"
+      log "RESULT sid=${sid:0:8} WARMED cache_read=$c_read cache_creation=$c_create nonce=${nonce:0:8} (request served from cache; TTL re-armed)"
+      rm -f "$mismatch_file"
       rc=0
     else
-      # Prefix mismatch: the fork paid a full cache write and refreshed nothing.
-      # Blacklist this sid so we never repeat the cost; loud log for diagnosis.
-      log "RESULT sid=${sid:0:8} MISMATCH cache_read=$c_read cache_creation=$c_create — fork prefix did not match; blacklisting sid"
-      touch "$STATE_DIR/${sid}.fork_mismatch"
+      # Low cache_read can mean prefix mismatch OR an already-cold cache.
+      # Warn on the first occurrence; blacklist only on the second in a row,
+      # so a one-off cold edge case doesn't permanently disable a session.
+      local miss_n
+      miss_n=$(read_int_state "$mismatch_file")
+      miss_n=$((miss_n + 1))
+      write_state "$mismatch_file" "$miss_n"
+      if (( miss_n >= 2 )); then
+        log "RESULT sid=${sid:0:8} MISMATCH cache_read=$c_read cache_creation=$c_create (2nd consecutive) — blacklisting sid"
+        touch "$STATE_DIR/${sid}.fork_mismatch"
+      else
+        log "RESULT sid=${sid:0:8} MISMATCH cache_read=$c_read cache_creation=$c_create (1st — warning only; will blacklist on repeat)"
+      fi
     fi
   fi
 
-  # The fork served its purpose; remove its jsonl so it never pollutes
-  # discovery or /resume listings.
-  [[ -n ${fork_jsonl:-} && -f ${fork_jsonl:-} ]] && rm -f "$fork_jsonl"
+  # Archive the fork transcript for audit instead of deleting it. Validate
+  # identity hard before moving: regular file, inside the project dir, UUID
+  # basename, not the live session, contains the nonce.
+  if [[ -n ${fork_jsonl:-} && -f ${fork_jsonl:-} ]]; then
+    local base
+    base=$(basename "$fork_jsonl" .jsonl)
+    if [[ $fork_jsonl == "$project_dir"/*.jsonl && $base =~ $UUID_RE && $base != "$sid" ]] \
+       && grep -qF "run=${nonce}" "$fork_jsonl" 2>/dev/null; then
+      if mv "$fork_jsonl" "$FORK_ARCHIVE_DIR/${base}.jsonl" 2>/dev/null; then
+        log "note: fork transcript archived to forks/${base}.jsonl"
+      else
+        log "note: could not archive fork transcript $fork_jsonl (left in place)"
+      fi
+    else
+      log "note: fork transcript identity not certain ($fork_jsonl) — left in place, NOT touched"
+    fi
+  fi
   return $rc
 }
+
+# Prune old archived fork transcripts (ours only).
+find "$FORK_ARCHIVE_DIR" -maxdepth 1 -name '*.jsonl' -mtime +"$FORK_RETENTION_DAYS" -delete 2>/dev/null || true
+
+# Clean up an orphaned fork session from a crashed run — but only if every
+# window matches our naming pattern; never kill a session a user repurposed.
+if tmux has-session -t "$FORK_TMUX_SESSION" 2>/dev/null; then
+  win_names=$(tmux list-windows -t "$FORK_TMUX_SESSION" -F '#{window_name}' 2>/dev/null || true)
+  if [[ -z $win_names ]] || ! printf '%s\n' "$win_names" | grep -qvE '^w[0-9]+-[0-9a-f]{8}$'; then
+    log "note: removing leftover $FORK_TMUX_SESSION tmux session"
+    tmux kill-session -t "$FORK_TMUX_SESSION" 2>/dev/null || true
+  else
+    log "note: $FORK_TMUX_SESSION exists with unexpected windows — leaving it alone"
+  fi
+fi
+
+NOW=$(date +%s)
 
 # Evaluate one candidate session; warm it if due. Args: jsonl, cwd, live_args.
 declare -A SEEN_SID
@@ -247,6 +355,7 @@ process_candidate() {
   [[ -f $jsonl ]] || return 0
   local sid
   sid=$(basename "$jsonl" .jsonl)
+  [[ $sid =~ $UUID_RE ]] || return 0
 
   [[ -z ${SEEN_SID[$sid]:-} ]] || return 0
   SEEN_SID[$sid]=1
@@ -258,24 +367,25 @@ process_candidate() {
     return 0
   fi
   if [[ -f "$STATE_DIR/${sid}.fork_mismatch" ]]; then
-    return 0   # previously measured prefix mismatch; warming wastes a full cache write
+    return 0   # repeated measured prefix mismatch; warming wastes a full cache write
   fi
 
-  # Cache freshness = most recent of (live API activity, our last fork-warm).
-  # Fork warms re-arm the cache without touching the live jsonl, so mtime
-  # alone would over-age warmed sessions.
-  local mtime state_file last_warm fresh age_min
+  # Cache freshness = most recent of (live API activity, our last SUCCESSFUL
+  # fork-warm). Fork warms re-arm the cache without touching the live jsonl,
+  # so warm state is tracked separately.
+  local mtime last_warm last_attempt fresh age_min
   mtime=$(stat -c %Y "$jsonl")
-  state_file="$STATE_DIR/${sid}.last_warm"
-  last_warm=0
-  [[ -f $state_file ]] && last_warm=$(cat "$state_file" 2>/dev/null || echo 0)
+  last_warm=$(read_int_state "$STATE_DIR/${sid}.last_warm")
+  last_attempt=$(read_int_state "$STATE_DIR/${sid}.last_attempt")
   fresh=$(( mtime > last_warm ? mtime : last_warm ))
   age_min=$(( (NOW - fresh) / 60 ))
 
   if (( age_min < WARM_MIN_AGE || age_min >= WARM_MAX_AGE )); then
     return 0   # comfortably warm, or past the window (cold) — quiet skip
   fi
-  if (( NOW - last_warm < RATELIMIT_MIN * 60 )); then
+  # Rate-limit on ATTEMPTS (not successes) so a failing session can't be
+  # hammered, while failures don't fake freshness.
+  if (( NOW - last_attempt < RATELIMIT_MIN * 60 )); then
     return 0
   fi
 
@@ -301,17 +411,11 @@ process_candidate() {
   if (( DRY_RUN )); then
     return 0
   fi
-  echo "$NOW" > "$state_file"
-  warm_by_fork "$sid" "$cwd" "$live_args" || true
+  write_state "$STATE_DIR/${sid}.last_attempt" "$(date +%s)"
+  if warm_by_fork "$sid" "$cwd" "$live_args"; then
+    write_state "$STATE_DIR/${sid}.last_warm" "$(date +%s)"
+  fi
 }
-
-# Kill any orphaned fork session left over from a crashed previous run.
-if tmux has-session -t "$FORK_TMUX_SESSION" 2>/dev/null; then
-  log "note: found leftover $FORK_TMUX_SESSION tmux session; killing it"
-  tmux kill-session -t "$FORK_TMUX_SESSION" 2>/dev/null || true
-fi
-
-NOW=$(date +%s)
 
 # Discover project dirs of running Claude TUI processes (and authoritative
 # --resume sids). Forks and -p/--print processes are never candidates.
@@ -333,7 +437,7 @@ while IFS=$'\t' read -r pid tty comm args; do
 
   if [[ $args == *"--resume "* ]]; then
     rsid=$(printf '%s\n' "$args" | grep -oE -- '--resume [0-9a-f-]+' | awk '{print $2}' | head -1 || true)
-    if [[ -n $rsid ]]; then
+    if [[ -n $rsid && $rsid =~ $UUID_RE ]]; then
       RESUME_SID_ARGS[$rsid]=$args
       RESUME_SID_CWD[$rsid]=$cwd
     fi
@@ -346,10 +450,14 @@ for rsid in "${!RESUME_SID_ARGS[@]}"; do
   [[ -n $jsonl ]] && process_candidate "$jsonl" "${RESUME_SID_CWD[$rsid]}" "${RESUME_SID_ARGS[$rsid]}"
 done
 
-# Then every session in each active project dir (snapshot the list up front so
-# fork jsonls created mid-run are never scanned).
+# Then recent sessions in each active project dir (snapshot the list up front
+# so fork jsonls created mid-run are never scanned; cap at the 10 newest to
+# bound cost). NOTE: this is heuristic — the warmer cannot prove which jsonl
+# belongs to which live TUI, so it may warm a recently-active session in the
+# same dir that no one returns to. The MIN_USER_MSGS, user-idle, and
+# warm-window gates bound that cost; RESULT receipts make it visible.
 for project_dir in "${!DIR_CWD[@]}"; do
-  mapfile -t candidates < <(ls -1 "$project_dir"/*.jsonl 2>/dev/null || true)
+  mapfile -t candidates < <(ls -1t "$project_dir"/*.jsonl 2>/dev/null | head -10 || true)
   for jsonl in "${candidates[@]}"; do
     process_candidate "$jsonl" "${DIR_CWD[$project_dir]}" "${DIR_ARGS[$project_dir]}"
   done

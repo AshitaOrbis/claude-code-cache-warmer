@@ -2,7 +2,9 @@
 # Copy to `config` next to cache-warmer.sh and edit. Sourced on every run.
 
 # Master switch. 0 = script exits immediately (timer keeps firing but does nothing).
-ENABLED=1
+# Deliberately DISABLED by default: run `python3 measure-ttl.py` to verify your
+# cache TTL and `./cache-warmer.sh --dry-run` to preview decisions, then set 1.
+ENABLED=0
 
 # Warm window: fork-warm a session only when its cache freshness (last live API
 # activity OR last fork-warm, whichever is newer) is between these ages
@@ -43,3 +45,10 @@ KEEPALIVE_TEXT='[cache-warmer keepalive] No action needed — reply with only: o
 # Fork lifecycle timeouts (seconds).
 FORK_SPAWN_TIMEOUT=180
 FORK_REPLY_TIMEOUT=120
+
+# Days to keep archived fork transcripts in ~/.cache/cache-warmer/forks/
+# (they are the audit trail for RESULT receipts; never deleted on the spot).
+FORK_RETENTION_DAYS=7
+
+# NOTE: this file is SOURCED as shell code by cache-warmer.sh on every run.
+# Keep it private (chmod 600) and put only KEY=value lines in it.
