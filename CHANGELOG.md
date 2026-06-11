@@ -1,5 +1,16 @@
 # Changelog
 
+## v0.3.0 — 2026-06-11
+
+- Warm results are now classified against the LIVE session's expected prefix
+  size (its last assistant turn's total input): `verified_full_hit`
+  (cache_read ≥ 80% of expected), `partial_hit` (mid-prefix divergence),
+  `short_request` (fork didn't replay the full context), `cold_or_mismatch`
+  (root divergence or expired cache), plus `*_no_baseline` fallbacks. RESULT
+  lines carry `class=` and `expected=` fields. Only `verified_full_hit`
+  counts as a successful warm; all other classes feed the two-strike
+  blacklist.
+
 ## v0.2.1 — 2026-06-11
 
 Fixes found by end-to-end testing of v0.2.0:

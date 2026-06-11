@@ -177,6 +177,32 @@ if u:
 PY
 }
 
+# Expected prefix size (tokens) = total input of the LIVE session's last
+# assistant turn. Used as the denominator to classify fork warm results.
+live_expected_tokens() {
+  python3 - "$1" <<'PY'
+import json, sys
+exp = 0
+try:
+    with open(sys.argv[1]) as fh:
+        for line in fh:
+            try:
+                rec = json.loads(line)
+            except Exception:
+                continue
+            if rec.get("type") == "assistant":
+                u = (rec.get("message") or {}).get("usage") or {}
+                t = (u.get("cache_read_input_tokens", 0) or 0) + \
+                    (u.get("cache_creation_input_tokens", 0) or 0) + \
+                    (u.get("input_tokens", 0) or 0)
+                if t > 0:
+                    exp = t
+except Exception:
+    pass
+print(exp)
+PY
+}
+
 # Replicate only prefix-relevant, value-validated flags from the live
 # process's cmdline. The fork's system prompt must reconstruct identically or
 # the cache misses; permission mode is part of that. Deliberately NOT
@@ -193,10 +219,10 @@ replicated_flags() {
   echo "$out"
 }
 
-# Warm one session by fork. Args: sid, cwd, live_args. Returns 0 on verified
-# warm, 1 otherwise. Logs RESULT/FAIL lines itself.
+# Warm one session by fork. Args: sid, cwd, live_args, live_jsonl. Returns 0
+# on verified warm, 1 otherwise. Logs RESULT/FAIL lines itself.
 warm_by_fork() {
-  local sid=$1 cwd=$2 live_args=$3
+  local sid=$1 cwd=$2 live_args=$3 live_jsonl=$4
   local project_dir="$HOME/.claude/projects/${cwd//\//-}"
   local flags win rc=1 nonce spawn_epoch
   [[ $sid =~ $UUID_RE ]] || { log "FAIL sid=${sid:0:8}: not a valid session UUID, refusing to fork"; return 1; }
@@ -299,26 +325,49 @@ warm_by_fork() {
   if [[ -z $usage ]]; then
     log "FAIL sid=${sid:0:8}: no nonce-matched fork reply within ${FORK_REPLY_TIMEOUT}s (fork_jsonl=${fork_jsonl:-unidentified})"
   else
-    local c_read c_create c_in total
+    # Classify against the LIVE session's expected prefix size, not just the
+    # fork request's own total — this distinguishes a diverged prefix from a
+    # request that simply didn't carry the full history.
+    local c_read c_create c_in total expected klass strike=0
     read -r c_read c_create c_in <<< "$usage"
     total=$(( c_read + c_create + c_in ))
-    if (( total > 0 && c_read * 2 >= total )); then
-      log "RESULT sid=${sid:0:8} WARMED cache_read=$c_read cache_creation=$c_create nonce=${nonce:0:8} (request served from cache; TTL re-armed)"
-      rm -f "$mismatch_file"
-      rc=0
+    expected=$(live_expected_tokens "$live_jsonl" || echo 0)
+    [[ $expected =~ ^[0-9]+$ ]] || expected=0
+    if (( expected <= 0 )); then
+      # No baseline available; fall back to the request-relative check.
+      if (( total > 0 && c_read * 2 >= total )); then klass=verified_hit_no_baseline; rc=0; else klass=mismatch_no_baseline; strike=1; fi
+    elif (( total * 2 < expected )); then
+      # Fork request is far smaller than the live prefix — it did not replay
+      # the same context (wrong session, heavy divergence, or fork-side
+      # compaction). TTL on the live prefix was NOT meaningfully re-armed.
+      klass=short_request; strike=1
+    elif (( c_read * 10 >= expected * 8 )); then
+      klass=verified_full_hit; rc=0
+    elif (( c_read * 5 >= expected )); then
+      # Matched the first part of the prefix, diverged mid-way. The matched
+      # depth is re-armed, the tail is not. Deterministic — will recur.
+      klass=partial_hit; strike=1
     else
-      # Low cache_read can mean prefix mismatch OR an already-cold cache.
-      # Warn on the first occurrence; blacklist only on the second in a row,
-      # so a one-off cold edge case doesn't permanently disable a session.
+      # Near-zero read with a full-size request: either the prefix diverged
+      # at the root, or the cache was already cold (shouldn't happen inside
+      # the warm window if the TTL model is right). Either way the live
+      # prefix is now written warm by this fork only if the prefixes match —
+      # which we can't confirm, so treat as a strike.
+      klass=cold_or_mismatch; strike=1
+    fi
+    if (( rc == 0 )); then
+      log "RESULT sid=${sid:0:8} WARMED class=$klass cache_read=$c_read cache_creation=$c_create expected=$expected nonce=${nonce:0:8}"
+      rm -f "$mismatch_file"
+    else
       local miss_n
       miss_n=$(read_int_state "$mismatch_file")
       miss_n=$((miss_n + 1))
       write_state "$mismatch_file" "$miss_n"
       if (( miss_n >= 2 )); then
-        log "RESULT sid=${sid:0:8} MISMATCH cache_read=$c_read cache_creation=$c_create (2nd consecutive) — blacklisting sid"
+        log "RESULT sid=${sid:0:8} MISMATCH class=$klass cache_read=$c_read cache_creation=$c_create expected=$expected (2nd consecutive) — blacklisting sid"
         touch "$STATE_DIR/${sid}.fork_mismatch"
       else
-        log "RESULT sid=${sid:0:8} MISMATCH cache_read=$c_read cache_creation=$c_create (1st — warning only; will blacklist on repeat)"
+        log "RESULT sid=${sid:0:8} MISMATCH class=$klass cache_read=$c_read cache_creation=$c_create expected=$expected (1st — warning only; will blacklist on repeat)"
       fi
     fi
   fi
@@ -424,7 +473,7 @@ process_candidate() {
     return 0
   fi
   write_state "$STATE_DIR/${sid}.last_attempt" "$(date +%s)"
-  if warm_by_fork "$sid" "$cwd" "$live_args"; then
+  if warm_by_fork "$sid" "$cwd" "$live_args" "$jsonl"; then
     write_state "$STATE_DIR/${sid}.last_warm" "$(date +%s)"
   fi
 }

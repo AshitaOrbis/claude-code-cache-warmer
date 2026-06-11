@@ -13,20 +13,21 @@ verifies the cache hit from the fork's own usage record, and archives the
 fork. The live session's transcript is left untouched (observed byte-identical
 before/after on v2.1.173); its next real turn lands on a hot cache.
 
-Real receipts from production use (a 700k-token writing session, warmed at 46
-minutes idle):
+Real receipts: a 700k-token session warmed organically at 46 minutes idle
+(v0.2.x format), and a v0.3.0 verification run with prefix classification:
 
 ```
-[13:33:26] WARM sid=31e0bcba age=46m user-idle=50m msgs=43 (fork-resume, live session untouched)
 [13:33:36] RESULT sid=31e0bcba WARMED cache_read=701051 cache_creation=914 (request served from cache; TTL re-armed)
+[14:17:10] RESULT sid=c2251586 WARMED class=verified_full_hit cache_read=68277 cache_creation=7653 expected=75875 nonce=58b6b941
 ```
 
 Every warm logs a `RESULT` line with the measured `cache_read` token count
-from the API's usage accounting. That number is an **evidence receipt**, not
-an absolute guarantee: it proves the fork's request was served from cache
-(which is what re-arms the TTL on those cache blocks); it cannot by itself
-prove every byte of the live prefix was reproduced. Mismatches are loud and
-auto-contained (see below).
+from the API's usage accounting, classified against the live session's
+expected prefix size (`verified_full_hit` / `partial_hit` / `short_request` /
+`cold_or_mismatch`). A receipt is **evidence**, not an absolute guarantee —
+but a `verified_full_hit` means the fork's request read ≥80% of the live
+session's prefix volume from cache, which is what re-arms the TTL on those
+blocks. Anything else is loud and auto-contained (see below).
 
 ## Why
 
@@ -130,9 +131,10 @@ and every spend is visible as a RESULT line. Use `EXCLUDE_SIDS` /
   identity isn't certain.
 - A folder-trust prompt in the fork **fails the warm loudly** — it is never
   auto-accepted.
-- A low cache-read result logs a warning first and blacklists the session only
-  on the second consecutive occurrence (a single low read can also mean the
-  cache was already cold, which isn't the session's fault).
+- Any result class other than `verified_full_hit` logs a warning first and
+  blacklists the session only on the second consecutive occurrence; the
+  `class=` field says *why* (mid-prefix divergence vs. short request vs.
+  root-divergence/cold).
 - A flock prevents overlapping runs; an exit trap kills the in-flight fork
   window if the script dies mid-warm; orphaned fork tmux sessions are removed
   only when every window matches the warmer's naming pattern.
