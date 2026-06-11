@@ -1,5 +1,18 @@
 # Changelog
 
+## v0.2.1 — 2026-06-11
+
+Fixes found by end-to-end testing of v0.2.0:
+
+- The NBSP in the readiness regex is now written as the `\u00a0` ANSI-C
+  escape — a literal no-break space character in the source was silently
+  normalized to a plain space during editing, breaking readiness detection.
+- Verify-then-commit scans the whole input area (last `❯`-line to pane end):
+  the nonce-tagged keepalive is long enough to wrap onto continuation lines.
+- After killing the fork window, wait for the process to fully exit before
+  archiving its transcript — Claude flushes a final record on shutdown, which
+  previously re-created a small stub in the project dir after the archive mv.
+
 ## v0.2.0 — 2026-06-11
 
 Hardening release responding to an external adversarial review (GPT-5.5 Pro;

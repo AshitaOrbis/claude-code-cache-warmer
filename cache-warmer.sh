@@ -225,8 +225,9 @@ warm_by_fork() {
     sleep 5; waited=$((waited+5))
     pane_txt=$(tmux capture-pane -t "$win" -p 2>/dev/null || true)
     # NB: the empty input line is "❯" + U+00A0 (no-break space), which
-    # [[:space:]] does not match — include the literal NBSP in the bracket.
-    if printf '%s\n' "$pane_txt" | grep -qE $'^❯[ \t ]*$'; then ready=1; break; fi
+    # [[:space:]] does not match — use the \u00a0 escape (a literal NBSP
+    # char gets silently normalized to a plain space by some editors).
+    if printf '%s\n' "$pane_txt" | grep -qE $'^❯[ \t\u00a0]*$'; then ready=1; break; fi
     # A folder-trust prompt is a security decision — never auto-accept it.
     if printf '%s\n' "$pane_txt" | grep -q "trust this folder"; then
       log "FAIL sid=${sid:0:8}: folder-trust prompt appeared for $cwd — trust the directory manually in Claude Code first"
@@ -245,12 +246,14 @@ warm_by_fork() {
   fi
 
   # Verify-then-commit the keepalive into OUR fork pane: the text must land
-  # intact on the input line (the LAST ❯-line) before Enter is pressed.
+  # intact in the input area before Enter is pressed. Long input wraps onto
+  # continuation lines below the ❯, so scan from the LAST ❯-line to pane end.
   tmux send-keys -t "$win" -l "$keepalive"
   sleep 0.5
-  local input_line
-  input_line=$(tmux capture-pane -t "$win" -p 2>/dev/null | grep -E '^❯' | tail -1 || true)
-  if ! printf '%s\n' "$input_line" | grep -qF "run=${nonce}"; then
+  local input_region
+  input_region=$(tmux capture-pane -t "$win" -p 2>/dev/null | \
+    awk '/^❯/{i=NR} {l[NR]=$0} END{if(i) for(n=i;n<=NR;n++) print l[n]}' || true)
+  if ! printf '%s\n' "$input_region" | grep -qF "run=${nonce}"; then
     log "FAIL sid=${sid:0:8}: keepalive text did not land on the fork input line"
     tmux send-keys -t "$win" Escape 2>/dev/null || true
     tmux kill-window -t "$win" 2>/dev/null || true
@@ -282,6 +285,15 @@ warm_by_fork() {
 
   tmux kill-window -t "$win" 2>/dev/null || true
   CURRENT_WIN=""
+  # Wait for the fork process to fully exit — it can flush a final write to
+  # its jsonl moments after the window dies, which would re-create the file
+  # after we archive it.
+  local dead_wait=0
+  while (( dead_wait < 10 )); do
+    tmux list-panes -t "$win" >/dev/null 2>&1 || break
+    sleep 1; dead_wait=$((dead_wait+1))
+  done
+  sleep 1
 
   local mismatch_file="$STATE_DIR/${sid}.mismatch_count"
   if [[ -z $usage ]]; then
