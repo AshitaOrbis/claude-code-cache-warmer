@@ -361,11 +361,23 @@ warm_by_fork() {
   fi
   tmux send-keys -t "$win" Enter
 
+  # Defensive re-submit: on a busy/remote-control session the fork can be mid
+  # bridge-reconnect when Enter is pressed and swallow it, leaving the keepalive
+  # sitting unsubmitted (no user record, no reply → timeout). If the keepalive
+  # is still on the input line a few seconds later, press Enter again. Harmless
+  # if the first submit worked (Enter on an empty prompt is a no-op).
+  sleep 6
+  if tmux capture-pane -t "$win" -p 2>/dev/null | \
+       awk '/^❯/{i=NR} {l[NR]=$0} END{if(i) for(n=i;n<=NR;n++) print l[n]}' | \
+       grep -qF "run=${nonce}"; then
+    tmux send-keys -t "$win" Enter
+  fi
+
   # Identify the fork jsonl by CONTENT: exactly one file in the project dir,
   # created/modified after spawn, containing our nonce. Directory-diff
   # heuristics can misidentify a real user session — never trust them.
   waited=0
-  local fork_jsonl="" usage="" matches match_count
+  local fork_jsonl="" usage="" matches match_count resubmits=0
   while (( waited < FORK_REPLY_TIMEOUT )); do
     sleep 5; waited=$((waited+5))
     if [[ -z $fork_jsonl ]]; then
@@ -374,6 +386,12 @@ warm_by_fork() {
       match_count=$(printf '%s\n' "$matches" | grep -c . || true)
       if [[ $match_count -eq 1 ]]; then
         fork_jsonl=$matches
+      elif (( resubmits < 3 )) && tmux capture-pane -t "$win" -p 2>/dev/null | \
+             awk '/^❯/{i=NR} {l[NR]=$0} END{if(i) for(n=i;n<=NR;n++) print l[n]}' | \
+             grep -qF "run=${nonce}"; then
+        # Still unsubmitted and no fork jsonl yet — keep nudging Enter as the
+        # session finishes reconnecting (bounded to 3 retries).
+        tmux send-keys -t "$win" Enter; resubmits=$((resubmits+1))
       fi
     fi
     if [[ -n $fork_jsonl && -f $fork_jsonl ]]; then

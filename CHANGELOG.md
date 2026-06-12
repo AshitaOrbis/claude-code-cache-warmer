@@ -1,5 +1,22 @@
 # Changelog
 
+## v0.3.3 — 2026-06-11
+
+- **Defensive keepalive re-submit** for busy / remote-control (`/rc`) sessions.
+  Forking an actively-reconnecting session can swallow the keepalive's Enter
+  (the text lands in the input box but never submits → no reply → timeout).
+  After the initial Enter, if the nonce is still on the input line, press Enter
+  again (and up to 3 more times during the reply wait, only while no fork jsonl
+  has appeared). Harmless on the happy path (Enter on an empty prompt is a
+  no-op). Verified: clean warm-cache MCP session still `verified_full_hit` at
+  ~99.99% cache_read.
+
+  Context: empirically confirmed the core path works on a normal warm-cache MCP
+  session (cache_read 86793/86795). The prior failures were unrepresentative
+  subjects — an aborted 0-message session, a 6.4h-cold session (cache already
+  expired → cache_read=0, correct), and an actively-orchestrating /rc session
+  (this fix).
+
 ## v0.3.2 — 2026-06-11
 
 **Fixes the main real-world failure: forks of large/old/MCP sessions never warmed.**
