@@ -1,5 +1,27 @@
 # Changelog
 
+## v0.3.2 — 2026-06-11
+
+**Fixes the main real-world failure: forks of large/old/MCP sessions never warmed.**
+Root cause: a fork resuming a substantial session hits an interactive startup
+prompt before the input line, so the readiness check timed out at 180s and the
+session was never warmed (no spend, but no warm either — and these are exactly
+the high-value sessions). Two prompts handled in the readiness loop:
+
+- **Resume-from-summary** (old/large sessions: "Resume from summary /
+  Resume full session as-is"): the warmer now selects **full resume** (option
+  2). Critically, a *summary* resume would build a different, smaller prefix
+  that wouldn't match — or re-arm — the live session's cache. (Reproduced and
+  verified: fork reaches the input line in ~10s instead of timing out.)
+- **MCP server-approval** ("[✔] server … Enter to confirm · Esc to reject
+  all"): the warmer confirms the pre-selected servers (Enter), never rejects —
+  rejecting would drop tools from the prefix and force a mismatch.
+
+Note: Claude Code auto-updated 2.1.173→2.1.174 during testing, which shifted
+which prompt a given fork shows — an instance of the binary-drift risk noted in
+BACKLOG. The handlers cover both; unrecognized prompts still fail safe (timeout,
+no spend).
+
 ## v0.3.1 — 2026-06-11
 
 Hardening from a second independent adversarial review (Claude Fable 5, max

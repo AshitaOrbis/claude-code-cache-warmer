@@ -299,8 +299,11 @@ warm_by_fork() {
   pane_pid=$(tmux list-panes -t "$win" -F '#{pane_pid}' 2>/dev/null | head -1 || true)
 
   # Wait for the fork TUI's empty input prompt. Large sessions take minutes
-  # to restore; that's fine, the slow path is exactly the valuable one.
-  local waited=0 pane_txt="" ready=0
+  # to restore; that's fine, the slow path is exactly the valuable one. Along
+  # the way, dismiss startup prompts that must be answered to preserve the live
+  # prefix (resume-from-summary, MCP approval) — otherwise the fork never
+  # reaches the input line and times out.
+  local waited=0 pane_txt="" ready=0 handled_summary=0 handled_mcp=0
   while (( waited < FORK_SPAWN_TIMEOUT )); do
     sleep 5; waited=$((waited+5))
     pane_txt=$(tmux capture-pane -t "$win" -p 2>/dev/null || true)
@@ -314,6 +317,22 @@ warm_by_fork() {
       tmux kill-window -t "$win" 2>/dev/null || true
       CURRENT_WIN=""
       return 1
+    fi
+    # Resume-from-summary prompt (old/large sessions): pick "Resume full session
+    # as-is" (option 2). A SUMMARY resume builds a different, smaller prefix that
+    # would NOT match — and would not re-arm — the live session's cache. This was
+    # the main reason large/MCP sessions failed to warm.
+    if (( ! handled_summary )) && printf '%s\n' "$pane_txt" | grep -qiE 'Resume full session as-is|Resume from summary'; then
+      tmux send-keys -t "$win" "2"; sleep 0.4; tmux send-keys -t "$win" Enter
+      handled_summary=1; sleep 3; continue
+    fi
+    # MCP server-approval prompt ("[✔] server … Enter to confirm · Esc to reject
+    # all"): confirm the PRE-SELECTED servers (Enter). The live session has these
+    # tools in its prefix; rejecting would drop them and force a mismatch. Never
+    # press Esc.
+    if (( ! handled_mcp )) && printf '%s\n' "$pane_txt" | grep -qE 'Enter to confirm.*([Ee]sc to reject|reject all)'; then
+      tmux send-keys -t "$win" Enter
+      handled_mcp=1; sleep 3; continue
     fi
   done
   if (( ! ready )); then
