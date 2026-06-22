@@ -34,6 +34,7 @@ LOG_DIR="$HOME/.claude/logs"
 LOG_FILE="$LOG_DIR/cache-warmer.log"
 STATE_DIR="$HOME/.cache/cache-warmer"
 FORK_ARCHIVE_DIR="$STATE_DIR/forks"
+RECEIPTS_FILE="$STATE_DIR/receipts.jsonl"   # structured per-warm receipts (jsonl)
 FORK_TMUX_SESSION="cache-warmer-forks-$(id -u)"
 UUID_RE='^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'
 SAFE_VALUE_RE='^[A-Za-z0-9._-]+$'
@@ -102,6 +103,32 @@ write_state() {
   local f=$1 v=$2 tmp
   tmp=$(mktemp "$STATE_DIR/.tmp.XXXXXX")
   printf '%s\n' "$v" > "$tmp" && mv "$tmp" "$f"
+}
+
+# Append a structured per-warm JSON receipt (one object per line) to
+# RECEIPTS_FILE. Args: sid nonce outcome class cache_read cache_creation
+# input_tokens expected. Built with jq so values are always valid JSON (no
+# string-concatenation). Numeric fields default to 0; non-integers are coerced.
+# Never aborts the run on failure — a receipt is an audit aid, not load-bearing.
+write_receipt() {
+  local sid=$1 nonce=$2 outcome=$3 klass=$4 c_read=${5:-0} c_create=${6:-0} c_in=${7:-0} expected=${8:-0}
+  for _v in c_read c_create c_in expected; do
+    [[ ${!_v} =~ ^[0-9]+$ ]] || printf -v "$_v" '%s' 0
+  done
+  jq -cn \
+    --arg ts "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+    --arg sid "$sid" \
+    --arg nonce "$nonce" \
+    --arg outcome "$outcome" \
+    --arg class "$klass" \
+    --argjson cache_read "$c_read" \
+    --argjson cache_creation "$c_create" \
+    --argjson input_tokens "$c_in" \
+    --argjson expected "$expected" \
+    '{timestamp:$ts, sid:$sid, nonce:$nonce, outcome:$outcome, class:$class,
+      cache_read:$cache_read, cache_creation:$cache_creation,
+      input_tokens:$input_tokens, expected:$expected}' \
+    >> "$RECEIPTS_FILE" 2>/dev/null || log "note: sid=${sid:0:8} could not append receipt"
 }
 
 if [[ ${ENABLED:-0} != 1 ]]; then
@@ -208,7 +235,19 @@ PY
 }
 
 # Expected prefix size (tokens) = total input of the LIVE session's last
-# assistant turn. Used as the denominator to classify fork warm results.
+# assistant turn AFTER the most recent compaction boundary. Used as the
+# denominator to classify fork warm results.
+#
+# Compaction-aware (see BACKLOG "Compaction-aware baseline"): when Claude Code
+# compacts, it writes an `isCompactSummary` user record and the prefix collapses
+# from the full history (~160k+) to the compaction summary (~60-80k). A fork
+# resuming a just-compacted session replays the SMALL compacted prefix. If we
+# kept the last PRE-compaction assistant turn as the baseline, that small fork
+# request would be mis-flagged `short_request` (request*2 < expected) and struck
+# unfairly. So we reset the baseline at every compaction boundary: only
+# post-compaction assistant turns count. If the session was compacted but has no
+# post-compaction assistant turn with usage yet, exp stays 0 → the classifier
+# falls back to the request-relative check (no false strike).
 live_expected_tokens() {
   python3 - "$1" <<'PY'
 import json, sys
@@ -219,6 +258,11 @@ try:
             try:
                 rec = json.loads(line)
             except Exception:
+                continue
+            # Compaction boundary: discard any pre-compaction baseline. The
+            # boundary is a user-type record flagged isCompactSummary.
+            if rec.get("type") == "user" and rec.get("isCompactSummary"):
+                exp = 0
                 continue
             # Skip subagent (sidechain) turns: they share the session file but
             # carry small per-subagent contexts that would skew the baseline.
@@ -263,10 +307,53 @@ replicated_flags() {
   echo "$out"
 }
 
-# Warm one session by fork. Args: sid, cwd, live_args, live_jsonl. Returns 0
-# on verified warm, 1 otherwise. Logs RESULT/FAIL lines itself.
+# Env vars that change the prompt prefix (model selection, system-prompt
+# behavior, cache TTL). A fork that doesn't replicate the live session's value
+# for these builds a different prefix and misses the cache. We read them from
+# the LIVE process's /proc/<pid>/environ and replay them into the fork — an
+# allowlist, never the whole environment (replaying secrets/PATH/etc. is both
+# unsafe and prefix-irrelevant). Anchored, exact names only.
+PREFIX_AFFECTING_ENV_RE='^(ANTHROPIC_MODEL|ANTHROPIC_SMALL_FAST_MODEL|ANTHROPIC_DEFAULT_HAIKU_MODEL|ANTHROPIC_DEFAULT_SONNET_MODEL|ANTHROPIC_DEFAULT_OPUS_MODEL|CLAUDE_CODE_SUBAGENT_MODEL|ENABLE_PROMPT_CACHING_1H|CLAUDE_CODE_MAX_OUTPUT_TOKENS|MAX_THINKING_TOKENS|CLAUDE_CODE_SIMPLE|DISABLE_PROMPT_CACHING)$'
+
+# Read the allowlisted prefix-affecting env vars from a live pid's environ and
+# emit them as `env`-ready, shell-quoted KEY=VALUE tokens (printf %q). Values
+# are passed through %q so a value with spaces/metacharacters survives the
+# shell string the fork is spawned through. Prints nothing if the pid is gone.
+replicated_env() {
+  local pid=$1
+  [[ $pid =~ ^[0-9]+$ ]] || return 0
+  local environ="/proc/$pid/environ"
+  [[ -r $environ ]] || return 0
+  local kv name val out=""
+  while IFS= read -r -d '' kv; do
+    name=${kv%%=*}
+    [[ $name == "$kv" ]] && continue          # no '=' → not a real var
+    [[ $name =~ $PREFIX_AFFECTING_ENV_RE ]] || continue
+    val=${kv#*=}
+    out+=" $(printf '%s=%q' "$name" "$val")"
+  done < "$environ"
+  echo "$out"
+}
+
+# Fingerprint of the `claude` binary: "version|mtime". A binary update shifts
+# the system-prompt prefix (observed across 2.1.173→174), so a fork built with
+# a newer binary than the one that wrote the live cache would diverge. Recorded
+# at discovery; compared against the warm baseline to skip on drift.
+claude_binary_fingerprint() {
+  local bin ver="" mt=""
+  bin=$(command -v claude 2>/dev/null) || { echo "unknown"; return 0; }
+  bin=$(readlink -f "$bin" 2>/dev/null || echo "$bin")
+  mt=$(stat -c %Y "$bin" 2>/dev/null || echo 0)
+  # `claude --version` is the authoritative prefix-affecting identity; mtime is
+  # a cheap fallback that also catches same-version rebuilds. Strip whitespace.
+  ver=$(claude --version 2>/dev/null | tr -d '[:space:]' || true)
+  echo "${ver:-noversion}|${mt:-0}"
+}
+
+# Warm one session by fork. Args: sid, cwd, live_args, live_jsonl, live_pid,
+# live_env. Returns 0 on verified warm, 1 otherwise. Logs RESULT/FAIL itself.
 warm_by_fork() {
-  local sid=$1 cwd=$2 live_args=$3 live_jsonl=$4
+  local sid=$1 cwd=$2 live_args=$3 live_jsonl=$4 live_pid=${5:-} live_env=${6:-}
   # Derive the project dir from the live jsonl itself — Claude Code mangles
   # more than just '/' in the cwd→dir mapping (e.g. '.' also becomes '-'), so
   # recomputing it from cwd is unreliable. The fork's jsonl lands beside the
@@ -281,10 +368,18 @@ warm_by_fork() {
   win="$FORK_TMUX_SESSION:w$$-${sid:0:8}"
   spawn_epoch=$(date +%s)
 
-  # The fork must request the same cache TTL as the live session. systemd
-  # user services do not source shell profiles, so set it explicitly here.
+  # Replicate the live session's prefix-affecting env (allowlist from
+  # /proc/<pid>/environ) so the fork's prompt prefix reconstructs identically.
+  # If the live process is gone or set none, fall back to ENABLE_PROMPT_CACHING_1H=1
+  # only — the cache TTL the warm window assumes. systemd user services do not
+  # source shell profiles, so the cache-TTL var must be set explicitly here.
+  local repl_env
+  repl_env=$(replicated_env "$live_pid")
+  [[ -n $live_env ]] && repl_env="$live_env"   # caller-captured snapshot wins (pid may be gone now)
+  [[ $repl_env == *"ENABLE_PROMPT_CACHING_1H="* ]] || repl_env+=" ENABLE_PROMPT_CACHING_1H=1"
   local spawn_cmd
-  spawn_cmd="env -u CLAUDECODE -u CLAUDE_CODE_ENTRYPOINT -u CLAUDE_CODE_SSE_PORT ENABLE_PROMPT_CACHING_1H=1 claude --resume $sid --fork-session$flags"
+  spawn_cmd="env -u CLAUDECODE -u CLAUDE_CODE_ENTRYPOINT -u CLAUDE_CODE_SSE_PORT$repl_env claude --resume $sid --fork-session$flags"
+  log "note: sid=${sid:0:8} fork env:${repl_env}"
 
   if tmux has-session -t "=$FORK_TMUX_SESSION" 2>/dev/null; then
     tmux new-window -d -t "=$FORK_TMUX_SESSION" -n "w$$-${sid:0:8}" -c "$cwd" "$spawn_cmd"
@@ -417,6 +512,7 @@ warm_by_fork() {
   local mismatch_file="$STATE_DIR/${sid}.mismatch_count"
   if [[ -z $usage ]]; then
     log "FAIL sid=${sid:0:8}: no nonce-matched fork reply within ${FORK_REPLY_TIMEOUT}s (fork_jsonl=${fork_jsonl:-unidentified})"
+    write_receipt "$sid" "$nonce" no_reply none 0 0 0 0
   else
     # Classify against the LIVE session's expected prefix size, not just the
     # fork request's own total — this distinguishes a diverged prefix from a
@@ -450,12 +546,14 @@ warm_by_fork() {
     fi
     if (( rc == 0 )); then
       log "RESULT sid=${sid:0:8} WARMED class=$klass cache_read=$c_read cache_creation=$c_create expected=$expected nonce=${nonce:0:8}"
+      write_receipt "$sid" "$nonce" warmed "$klass" "$c_read" "$c_create" "$c_in" "$expected"
       rm -f "$mismatch_file"
     else
       local miss_n
       miss_n=$(read_int_state "$mismatch_file")
       miss_n=$((miss_n + 1))
       write_state "$mismatch_file" "$miss_n"
+      write_receipt "$sid" "$nonce" mismatch "$klass" "$c_read" "$c_create" "$c_in" "$expected"
       if (( miss_n >= 2 )); then
         log "RESULT sid=${sid:0:8} MISMATCH class=$klass cache_read=$c_read cache_creation=$c_create expected=$expected (2nd consecutive) — blacklisting sid"
         touch "$STATE_DIR/${sid}.fork_mismatch"
@@ -503,10 +601,16 @@ if (( ! DRY_RUN )); then
   fi
 fi
 
-# Evaluate one candidate session; warm it if due. Args: jsonl, cwd, live_args.
+# Current `claude` binary fingerprint, captured once per run. Used to skip
+# warming a session whose last warm was built by a different binary (a Claude
+# Code update shifts the system-prompt prefix — see claude_binary_fingerprint).
+CLAUDE_FP_NOW=$(claude_binary_fingerprint)
+
+# Evaluate one candidate session; warm it if due. Args: jsonl, cwd, live_args,
+# live_pid, live_env.
 declare -A SEEN_SID
 process_candidate() {
-  local jsonl=$1 cwd=$2 live_args=$3
+  local jsonl=$1 cwd=$2 live_args=$3 live_pid=${4:-} live_env=${5:-}
   # Recompute now — a multi-warm run can take many minutes, and a stale `now`
   # would mis-age later candidates (warming a cold session, false strikes).
   local now; now=$(date +%s)
@@ -603,19 +707,40 @@ process_candidate() {
     return 0
   fi
 
+  # Binary-drift guard: if the freshness reference is a prior fork-warm (not new
+  # live activity) and the `claude` binary has changed since that warm, the
+  # cached prefix was built by the old binary and a new-binary fork would
+  # diverge. Skip and refresh the baseline so the live session can re-arm
+  # organically before we warm against the new binary. (When live activity is
+  # newer than our last warm, the live session itself rebuilt the prefix with
+  # the current binary, so no drift concern.)
+  local bin_file="$STATE_DIR/${sid}.warm_binary"
+  if (( last_warm >= mtime )) && [[ -f $bin_file ]]; then
+    local warm_fp
+    warm_fp=$(cat "$bin_file" 2>/dev/null || true)
+    if [[ -n $warm_fp && $warm_fp != "$CLAUDE_FP_NOW" ]]; then
+      log "skip sid=${sid:0:8} age=${age_min}m: claude binary drifted since last warm (${warm_fp%%|*} → ${CLAUDE_FP_NOW%%|*}); refreshing baseline"
+      (( DRY_RUN )) || write_state "$bin_file" "$CLAUDE_FP_NOW"
+      return 0
+    fi
+  fi
+
   log "WARM sid=${sid:0:8} age=${age_min}m user-idle=${user_idle_min}m msgs=${user_count} (fork-resume, live session untouched)"
   if (( DRY_RUN )); then
     return 0
   fi
   write_state "$STATE_DIR/${sid}.last_attempt" "$(date +%s)"
-  if warm_by_fork "$sid" "$cwd" "$live_args" "$jsonl"; then
+  if warm_by_fork "$sid" "$cwd" "$live_args" "$jsonl" "$live_pid" "$live_env"; then
     write_state "$STATE_DIR/${sid}.last_warm" "$(date +%s)"
+    write_state "$bin_file" "$CLAUDE_FP_NOW"
   fi
 }
 
 # Discover project dirs of running Claude TUI processes (and authoritative
-# --resume sids). Forks and -p/--print processes are never candidates.
-declare -A DIR_CWD DIR_ARGS RESUME_SID_ARGS RESUME_SID_CWD
+# --resume sids). Forks and -p/--print processes are never candidates. The
+# live pid and a snapshot of its prefix-affecting env are captured here so the
+# fork can replicate them even if the live process exits before the warm runs.
+declare -A DIR_CWD DIR_ARGS DIR_PID DIR_ENV RESUME_SID_ARGS RESUME_SID_CWD RESUME_SID_PID RESUME_SID_ENV
 while IFS=$'\t' read -r pid tty comm args; do
   # Match both direct `claude` and wrapper-launched instances (npx/node execing
   # the CLI) whose argv still names the claude entrypoint.
@@ -630,14 +755,19 @@ while IFS=$'\t' read -r pid tty comm args; do
   [[ -n $cwd ]] || continue
   project_dir="$HOME/.claude/projects/${cwd//\//-}"
   [[ -d $project_dir ]] || continue
+  live_env=$(replicated_env "$pid")
   DIR_CWD[$project_dir]=$cwd
   DIR_ARGS[$project_dir]=$args
+  DIR_PID[$project_dir]=$pid
+  DIR_ENV[$project_dir]=$live_env
 
   if [[ $args == *"--resume "* ]]; then
     rsid=$(printf '%s\n' "$args" | grep -oE -- '--resume [0-9a-f-]+' | awk '{print $2}' | head -1 || true)
     if [[ -n $rsid && $rsid =~ $UUID_RE ]]; then
       RESUME_SID_ARGS[$rsid]=$args
       RESUME_SID_CWD[$rsid]=$cwd
+      RESUME_SID_PID[$rsid]=$pid
+      RESUME_SID_ENV[$rsid]=$live_env
     fi
   fi
 done < <(ps -eo pid=,tty=,comm=,args= --no-headers | awk '{pid=$1; tty=$2; comm=$3; $1=$2=$3=""; sub(/^ +/,""); print pid "\t" tty "\t" comm "\t" $0}')
@@ -645,7 +775,8 @@ done < <(ps -eo pid=,tty=,comm=,args= --no-headers | awk '{pid=$1; tty=$2; comm=
 # Authoritative --resume sessions first (their jsonl may sit outside the cwd dir).
 for rsid in "${!RESUME_SID_ARGS[@]}"; do
   jsonl=$(find "$HOME/.claude/projects" -maxdepth 3 -name "${rsid}.jsonl" 2>/dev/null | head -1 || true)
-  [[ -n $jsonl ]] && process_candidate "$jsonl" "${RESUME_SID_CWD[$rsid]}" "${RESUME_SID_ARGS[$rsid]}"
+  [[ -n $jsonl ]] && process_candidate "$jsonl" "${RESUME_SID_CWD[$rsid]}" "${RESUME_SID_ARGS[$rsid]}" \
+    "${RESUME_SID_PID[$rsid]}" "${RESUME_SID_ENV[$rsid]}"
 done
 
 # Then recent sessions in each active project dir (snapshot the list up front
@@ -657,7 +788,8 @@ done
 for project_dir in "${!DIR_CWD[@]}"; do
   mapfile -t candidates < <(ls -1t "$project_dir"/*.jsonl 2>/dev/null | head -10 || true)
   for jsonl in "${candidates[@]}"; do
-    process_candidate "$jsonl" "${DIR_CWD[$project_dir]}" "${DIR_ARGS[$project_dir]}"
+    process_candidate "$jsonl" "${DIR_CWD[$project_dir]}" "${DIR_ARGS[$project_dir]}" \
+      "${DIR_PID[$project_dir]}" "${DIR_ENV[$project_dir]}"
   done
 done
 
