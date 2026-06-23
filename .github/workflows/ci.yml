@@ -1,0 +1,49 @@
+name: CI
+
+on:
+  push:
+    branches: [master, main]
+  pull_request:
+
+jobs:
+  lint-and-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Show tool versions
+        run: |
+          bash --version | head -1
+          python3 --version
+          jq --version
+
+      # ShellCheck on every tracked shell script. severity=warning catches real
+      # bugs (unset vars, bad quoting, status confusion) while tolerating the
+      # repo's deliberate aligned-comment / style choices. -x follows `source`.
+      - name: ShellCheck
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq shellcheck
+          shellcheck --version
+          shellcheck -x --severity=warning \
+            cache-warmer.sh install.sh lib/classify.sh tests/run.sh
+
+      # shfmt format check on the files this repo formats with shfmt (lib/ +
+      # tests/). cache-warmer.sh / install.sh predate shfmt adoption and use an
+      # aligned-comment style shfmt would collapse, so they are not gated here.
+      - name: shfmt (format check)
+        run: |
+          curl -fsSL https://github.com/mvdan/sh/releases/download/v3.8.0/shfmt_v3.8.0_linux_amd64 -o /usr/local/bin/shfmt
+          chmod +x /usr/local/bin/shfmt
+          shfmt --version
+          shfmt -i 2 -ci -d lib/classify.sh tests/run.sh
+
+      # Python parsers must byte-compile (syntax + import sanity).
+      - name: py_compile
+        run: |
+          python3 -m py_compile lib/jsonl.py measure-ttl.py
+
+      # Core-logic test suite (parsing, classification, submit detection).
+      # Never forks a live Claude session — pure fixture-driven logic.
+      - name: Run tests
+        run: bash tests/run.sh

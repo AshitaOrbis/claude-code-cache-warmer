@@ -1,0 +1,3 @@
+{"type":"user","timestamp":"2026-06-22T10:51:00.000Z","message":{"role":"user","content":"[cache-warmer keepalive] Reply with exactly: ok [run=99999999-8888-7777-6666-555555555555]"}}
+{"type":"assistant","timestamp":"2026-06-22T10:51:03.000Z","message":{"role":"assistant","content":[{"type":"text","text":"transient error, retrying"}]}}
+{"type":"assistant","timestamp":"2026-06-22T10:51:11.000Z","message":{"role":"assistant","content":[{"type":"text","text":"ok"}],"usage":{"cache_read_input_tokens":52000,"cache_creation_input_tokens":0,"input_tokens":20}}}

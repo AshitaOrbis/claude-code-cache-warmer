@@ -30,6 +30,11 @@ set -euo pipefail
 
 SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 CONFIG_FILE="$SCRIPT_DIR/config"
+LIB_DIR="$SCRIPT_DIR/lib"
+JSONL_PY="$LIB_DIR/jsonl.py"   # JSONL transcript parsers (see lib/jsonl.py)
+# Pure warm-result classifier, extracted for unit testing (see lib/classify.sh).
+# shellcheck source=lib/classify.sh
+source "$LIB_DIR/classify.sh"
 LOG_DIR="$HOME/.claude/logs"
 LOG_FILE="$LOG_DIR/cache-warmer.log"
 STATE_DIR="$HOME/.cache/cache-warmer"
@@ -69,7 +74,11 @@ for _re in EXCLUDE_SIDS INCLUDE_ONLY_SIDS; do
   # doesn't match returns 1. Only status 2 is a config error. The `|| _st=$?`
   # both captures the status and keeps set -e from firing on the no-match case.
   if [[ -n ${!_re} ]]; then
-    _st=0; [[ "x" =~ ${!_re} ]] || _st=$?
+    _st=0
+    # SC2319: capturing the [[ ]] regex-compile status is exactly the intent —
+    # status 2 means the regex itself is invalid (vs 1 = valid but no match).
+    # shellcheck disable=SC2319
+    [[ "x" =~ ${!_re} ]] || _st=$?
     (( _st >= 2 )) && { echo "config error: $_re is not a valid regex" >&2; exit 2; }
   fi
 done
@@ -153,85 +162,22 @@ trap cleanup_current_win EXIT INT TERM HUP
 
 # Last real-user-message epoch + count for a session jsonl. Real = type=user,
 # not a tool result, not meta, not a keepalive. Prints "epoch count".
+# (Logic in lib/jsonl.py so it can be unit tested against fixtures.)
 user_activity() {
-  python3 - "$1" <<'PY'
-import json, sys, datetime
-marker = "[cache-warmer keepalive]"
-last, count = None, 0
-try:
-    with open(sys.argv[1]) as fh:
-        for line in fh:
-            try:
-                rec = json.loads(line)
-            except Exception:
-                continue
-            if rec.get("type") != "user" or rec.get("isMeta") or "toolUseResult" in rec:
-                continue
-            content = (rec.get("message") or {}).get("content")
-            if isinstance(content, list):
-                if any(b.get("type") == "tool_result" for b in content if isinstance(b, dict)):
-                    continue
-                text = " ".join(b.get("text", "") for b in content if isinstance(b, dict))
-            else:
-                text = content or ""
-            if marker in text:
-                continue
-            ts = rec.get("timestamp")
-            if not ts:
-                continue
-            try:
-                datetime.datetime.fromisoformat(ts.replace("Z", "+00:00"))
-            except Exception:
-                continue
-            last, count = ts, count + 1
-except Exception:
-    pass
-if last:
-    epoch = int(datetime.datetime.fromisoformat(last.replace("Z", "+00:00")).timestamp())
-    print(epoch, count)
-PY
+  python3 "$JSONL_PY" user-activity "$1"
 }
 
 # Usage of the assistant turn that ANSWERS our nonce-tagged keepalive.
 # Prints "read creation input" only when that causal pair exists.
 fork_usage_for_nonce() {
-  python3 - "$1" "$2" <<'PY'
-import json, sys
-path, nonce = sys.argv[1], sys.argv[2]
-seen_nonce = False
-u = None
-try:
-    with open(path) as fh:
-        for line in fh:
-            try:
-                rec = json.loads(line)
-            except Exception:
-                continue
-            if not seen_nonce:
-                if rec.get("type") != "user" or "toolUseResult" in rec:
-                    continue
-                content = (rec.get("message") or {}).get("content")
-                text = content if isinstance(content, str) else " ".join(
-                    b.get("text", "") for b in (content or []) if isinstance(b, dict))
-                if nonce in (text or ""):
-                    seen_nonce = True
-            else:
-                # First real assistant turn after the nonce with usable usage.
-                # Skip sidechain turns and usage-less records (e.g. an error
-                # turn before a successful retry).
-                if rec.get("type") == "assistant" and not rec.get("isSidechain"):
-                    cand = (rec.get("message") or {}).get("usage") or {}
-                    if any(cand.get(k) for k in ("cache_read_input_tokens",
-                                                 "cache_creation_input_tokens", "input_tokens")):
-                        u = cand
-                        break
-except Exception:
-    pass
-if u:
-    print(u.get("cache_read_input_tokens", 0) or 0,
-          u.get("cache_creation_input_tokens", 0) or 0,
-          u.get("input_tokens", 0) or 0)
-PY
+  python3 "$JSONL_PY" fork-usage "$1" "$2"
+}
+
+# Deterministic submit proof (BACKLOG cw-2): a real user record carrying the
+# nonce means Claude Code accepted the keepalive as a turn — independent of any
+# TUI rendering. Exit 0 if confirmed, 1 otherwise.
+submit_confirmed() {
+  python3 "$JSONL_PY" submit-confirmed "$1" "$2"
 }
 
 # Expected prefix size (tokens) = total input of the LIVE session's last
@@ -249,34 +195,7 @@ PY
 # post-compaction assistant turn with usage yet, exp stays 0 → the classifier
 # falls back to the request-relative check (no false strike).
 live_expected_tokens() {
-  python3 - "$1" <<'PY'
-import json, sys
-exp = 0
-try:
-    with open(sys.argv[1]) as fh:
-        for line in fh:
-            try:
-                rec = json.loads(line)
-            except Exception:
-                continue
-            # Compaction boundary: discard any pre-compaction baseline. The
-            # boundary is a user-type record flagged isCompactSummary.
-            if rec.get("type") == "user" and rec.get("isCompactSummary"):
-                exp = 0
-                continue
-            # Skip subagent (sidechain) turns: they share the session file but
-            # carry small per-subagent contexts that would skew the baseline.
-            if rec.get("type") == "assistant" and not rec.get("isSidechain"):
-                u = (rec.get("message") or {}).get("usage") or {}
-                t = (u.get("cache_read_input_tokens", 0) or 0) + \
-                    (u.get("cache_creation_input_tokens", 0) or 0) + \
-                    (u.get("input_tokens", 0) or 0)
-                if t > 0:
-                    exp = t
-except Exception:
-    pass
-print(exp)
-PY
+  python3 "$JSONL_PY" expected-tokens "$1"
 }
 
 # Flags that change the prompt prefix but that we do NOT replicate. If a live
@@ -456,39 +375,54 @@ warm_by_fork() {
   fi
   tmux send-keys -t "$win" Enter
 
-  # Defensive re-submit: on a busy/remote-control session the fork can be mid
-  # bridge-reconnect when Enter is pressed and swallow it, leaving the keepalive
-  # sitting unsubmitted (no user record, no reply → timeout). If the keepalive
-  # is still on the input line a few seconds later, press Enter again. Harmless
-  # if the first submit worked (Enter on an empty prompt is a no-op).
-  sleep 6
-  if tmux capture-pane -t "$win" -p 2>/dev/null | \
-       awk '/^❯/{i=NR} {l[NR]=$0} END{if(i) for(n=i;n<=NR;n++) print l[n]}' | \
-       grep -qF "run=${nonce}"; then
-    tmux send-keys -t "$win" Enter
-  fi
+  # Submission + reply loop. SOURCE OF TRUTH is the fork JSONL, not the pane
+  # (BACKLOG cw-2): a real user record carrying the nonce is deterministic proof
+  # Claude Code accepted the keepalive as a turn and sent it to the model —
+  # independent of any TUI render change. The pane is used only as a SECONDARY
+  # signal to decide whether an un-submitted keepalive needs another Enter.
+  #
+  # The fork's keepalive turn is committed exactly once: the instant
+  # submit_confirmed sees the user record we STOP nudging Enter — a second Enter
+  # then would create a duplicate turn. Until that proof exists, on a
+  # busy/remote-control session the fork can swallow the first Enter while
+  # mid-bridge-reconnect, so if the keepalive is still sitting on the input line
+  # we press Enter again (bounded). This replaces the old pane-scrape-as-truth
+  # resubmit, which could misread submission state from wrapped/redrawn panes.
+  #
+  # pane_has_unsent_keepalive: nonce still visible from the last ❯-line to pane
+  # end (i.e. typed but not yet submitted). Kept as the fallback nudge trigger.
+  pane_has_unsent_keepalive() {
+    tmux capture-pane -t "$win" -p 2>/dev/null | \
+      awk '/^❯/{i=NR} {l[NR]=$0} END{if(i) for(n=i;n<=NR;n++) print l[n]}' | \
+      grep -qF "run=${nonce}"
+  }
 
-  # Identify the fork jsonl by CONTENT: exactly one file in the project dir,
-  # created/modified after spawn, containing our nonce. Directory-diff
-  # heuristics can misidentify a real user session — never trust them.
   waited=0
-  local fork_jsonl="" usage="" matches match_count resubmits=0
+  local fork_jsonl="" usage="" matches match_count resubmits=0 submitted=0
   while (( waited < FORK_REPLY_TIMEOUT )); do
     sleep 5; waited=$((waited+5))
+    # Identify the fork jsonl by CONTENT: exactly one file in the project dir,
+    # created/modified after spawn, containing our nonce. Directory-diff
+    # heuristics can misidentify a real user session — never trust them.
     if [[ -z $fork_jsonl ]]; then
       matches=$(find "$project_dir" -maxdepth 1 -name '*.jsonl' -newermt "@$spawn_epoch" \
                   -exec grep -l -F "run=${nonce}" {} + 2>/dev/null || true)
       match_count=$(printf '%s\n' "$matches" | grep -c . || true)
-      if [[ $match_count -eq 1 ]]; then
-        fork_jsonl=$matches
-      elif (( resubmits < 3 )) && tmux capture-pane -t "$win" -p 2>/dev/null | \
-             awk '/^❯/{i=NR} {l[NR]=$0} END{if(i) for(n=i;n<=NR;n++) print l[n]}' | \
-             grep -qF "run=${nonce}"; then
-        # Still unsubmitted and no fork jsonl yet — keep nudging Enter as the
-        # session finishes reconnecting (bounded to 3 retries).
-        tmux send-keys -t "$win" Enter; resubmits=$((resubmits+1))
-      fi
+      [[ $match_count -eq 1 ]] && fork_jsonl=$matches
     fi
+    # Deterministic submit confirmation: once the JSONL holds the user record,
+    # the turn is committed for good — never nudge Enter again.
+    if (( ! submitted )) && [[ -n $fork_jsonl && -f $fork_jsonl ]] \
+         && submit_confirmed "$fork_jsonl" "$nonce"; then
+      submitted=1
+    fi
+    # Fallback nudge: not yet confirmed submitted, and the keepalive is still
+    # unsent on the input line → press Enter again as the session finishes
+    # reconnecting (bounded to 3 retries). Harmless once submitted (guarded out).
+    if (( ! submitted && resubmits < 3 )) && pane_has_unsent_keepalive; then
+      tmux send-keys -t "$win" Enter; resubmits=$((resubmits+1))
+    fi
+    # Read the answering assistant turn's usage once the fork jsonl is known.
     if [[ -n $fork_jsonl && -f $fork_jsonl ]]; then
       usage=$(fork_usage_for_nonce "$fork_jsonl" "$nonce" || true)
       [[ -n $usage ]] && break
@@ -516,34 +450,12 @@ warm_by_fork() {
   else
     # Classify against the LIVE session's expected prefix size, not just the
     # fork request's own total — this distinguishes a diverged prefix from a
-    # request that simply didn't carry the full history.
-    local c_read c_create c_in total expected klass strike=0
+    # request that simply didn't carry the full history. The arithmetic lives
+    # in lib/classify.sh (classify_warm) so it can be unit tested in isolation.
+    local c_read c_create c_in expected klass strike
     read -r c_read c_create c_in <<< "$usage"
-    total=$(( c_read + c_create + c_in ))
     expected=$(live_expected_tokens "$live_jsonl" || echo 0)
-    [[ $expected =~ ^[0-9]+$ ]] || expected=0
-    if (( expected <= 0 )); then
-      # No baseline available; fall back to the request-relative check.
-      if (( total > 0 && c_read * 2 >= total )); then klass=verified_hit_no_baseline; rc=0; else klass=mismatch_no_baseline; strike=1; fi
-    elif (( total * 2 < expected )); then
-      # Fork request is far smaller than the live prefix — it did not replay
-      # the same context (wrong session, heavy divergence, or fork-side
-      # compaction). TTL on the live prefix was NOT meaningfully re-armed.
-      klass=short_request; strike=1
-    elif (( c_read * 10 >= expected * 8 )); then
-      klass=verified_full_hit; rc=0
-    elif (( c_read * 5 >= expected )); then
-      # Matched the first part of the prefix, diverged mid-way. The matched
-      # depth is re-armed, the tail is not. Deterministic — will recur.
-      klass=partial_hit; strike=1
-    else
-      # Near-zero read with a full-size request: either the prefix diverged
-      # at the root, or the cache was already cold (shouldn't happen inside
-      # the warm window if the TTL model is right). Either way the live
-      # prefix is now written warm by this fork only if the prefixes match —
-      # which we can't confirm, so treat as a strike.
-      klass=cold_or_mismatch; strike=1
-    fi
+    read -r klass rc strike < <(classify_warm "$c_read" "$c_create" "$c_in" "$expected")
     if (( rc == 0 )); then
       log "RESULT sid=${sid:0:8} WARMED class=$klass cache_read=$c_read cache_creation=$c_create expected=$expected nonce=${nonce:0:8}"
       write_receipt "$sid" "$nonce" warmed "$klass" "$c_read" "$c_create" "$c_in" "$expected"
