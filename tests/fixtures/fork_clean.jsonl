@@ -1,0 +1,4 @@
+{"type":"user","timestamp":"2026-06-22T10:50:00.000Z","message":{"role":"user","content":"second real question"}}
+{"type":"assistant","timestamp":"2026-06-22T10:50:05.000Z","message":{"role":"assistant","content":[{"type":"text","text":"answer two"}],"usage":{"cache_read_input_tokens":48000,"cache_creation_input_tokens":2000,"input_tokens":80}}}
+{"type":"user","timestamp":"2026-06-22T10:51:00.000Z","message":{"role":"user","content":"[cache-warmer keepalive] Automated cache keepalive. Reply with exactly: ok [run=11111111-2222-3333-4444-555555555555]"}}
+{"type":"assistant","timestamp":"2026-06-22T10:51:09.000Z","message":{"role":"assistant","content":[{"type":"text","text":"ok"}],"usage":{"cache_read_input_tokens":49500,"cache_creation_input_tokens":500,"input_tokens":30}}}

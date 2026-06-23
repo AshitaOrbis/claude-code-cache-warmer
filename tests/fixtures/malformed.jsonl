@@ -1,0 +1,5 @@
+{"type":"user","timestamp":"2026-06-22T10:00:00.000Z","message":{"role":"user","content":"valid line one"}}
+this is not json at all
+{"type":"user","timestamp":"not-a-real-timestamp","message":{"role":"user","content":"bad timestamp, must be skipped"}}
+{"type":"assistant","timestamp":"2026-06-22T10:00:05.000Z"
+{"type":"user","timestamp":"2026-06-22T10:10:00.000Z","message":{"role":"user","content":"valid line two"}}

@@ -1,0 +1,6 @@
+{"type":"user","timestamp":"2026-06-22T10:00:00.000Z","message":{"role":"user","content":"first real question"}}
+{"type":"assistant","timestamp":"2026-06-22T10:00:05.000Z","message":{"role":"assistant","content":[{"type":"text","text":"answer one"}],"usage":{"cache_read_input_tokens":0,"cache_creation_input_tokens":50000,"input_tokens":120}}}
+{"type":"user","timestamp":"2026-06-22T10:05:00.000Z","message":{"role":"user","content":[{"type":"tool_result","content":"some tool output"}]}}
+{"type":"user","isMeta":true,"timestamp":"2026-06-22T10:05:30.000Z","message":{"role":"user","content":"meta sidebar note"}}
+{"type":"user","timestamp":"2026-06-22T10:06:00.000Z","message":{"role":"user","content":[{"type":"text","text":"second real question"}]}}
+{"type":"assistant","timestamp":"2026-06-22T10:06:10.000Z","message":{"role":"assistant","content":[{"type":"text","text":"answer two"}],"usage":{"cache_read_input_tokens":48000,"cache_creation_input_tokens":2000,"input_tokens":80}}}

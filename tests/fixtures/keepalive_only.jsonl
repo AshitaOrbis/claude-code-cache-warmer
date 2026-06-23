@@ -1,0 +1,2 @@
+{"type":"user","timestamp":"2026-06-22T11:30:00.000Z","message":{"role":"user","content":"[cache-warmer keepalive] Automated cache keepalive. Reply with exactly: ok [run=12121212-3434-5656-7878-909090909090]"}}
+{"type":"assistant","timestamp":"2026-06-22T11:30:08.000Z","message":{"role":"assistant","content":[{"type":"text","text":"ok"}],"usage":{"cache_read_input_tokens":40000,"cache_creation_input_tokens":0,"input_tokens":20}}}
