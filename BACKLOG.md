@@ -46,3 +46,17 @@ Deferred improvements from the 2026-06-11 GPT-5.5 Pro review
 - [x] **Structured receipts** (cw-8): appends per-warm JSON receipts (ts, sid,
   nonce, usage tokens, outcome, class, expected) to
   `~/.cache/cache-warmer/receipts.jsonl` via `jq`.
+
+## v3 (replay) follow-ups — added 2026-07-02
+
+- [ ] install.sh: install prefix-proxy.service + repoint cache-warmer.service
+      to replay-warmer.sh (currently manual)
+- [ ] Tests/CI for replay-warmer.sh gating + warm-replay.py (v2 test suite
+      covers the fork engine only)
+- [ ] Evaluate OTEL_LOG_RAW_API_BODIES as a proxy-less capture source
+      (headers still need a source; replay requires exact anthropic-beta +
+      x-claude-code-session-id)
+- [ ] Evaluate --exclude-dynamic-system-prompt-sections as a fork-warming
+      revival path (requires ALL live sessions launched with it)
+- [ ] Capture-store hardening: per-session single-file rotation instead of
+      accumulate-and-prune

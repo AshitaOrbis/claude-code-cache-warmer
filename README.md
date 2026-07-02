@@ -1,9 +1,17 @@
 # claude-code-cache-warmer
 
-> **Status: experimental.** Built and verified on Claude Code v2.1.173 / GNU
-> Linux, 2026-06-11. It couples to Claude Code internals (TUI rendering,
-> `--fork-session` behavior, session-log schema) that can change between
-> versions. Disabled by default; read this whole README before enabling.
+> **⚠ v2 (fork-based, this README) is BROKEN on Claude Code ≥ 2.1.198** — the
+> system prompt now embeds a session-specific scratchpad path, so a fork's
+> prefix can never match its parent's and every warm pays a full cache write
+> for zero hits. **Use v3 (replay-based) instead**: `prefix-proxy.js` +
+> `replay-warmer.sh` + `warm-replay.py`, which replays each session's own
+> captured request byte-for-byte (verified: `cache_read=71383,
+> cache_creation=0`). Diagnosis + v3 architecture: [docs/V3-DIAGNOSIS.md](docs/V3-DIAGNOSIS.md).
+>
+> **Status: experimental.** v2 was built and verified on Claude Code v2.1.173 /
+> GNU Linux, 2026-06-11; v3 on v2.1.198, 2026-07-02. Both couple to Claude
+> Code internals that can change between versions. Disabled by default; read
+> this whole README before enabling.
 
 Keep long Claude Code sessions warm in the Anthropic prompt cache — **without
 modifying the sessions**. When an idle session approaches cache expiry, the

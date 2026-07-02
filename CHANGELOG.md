@@ -1,5 +1,20 @@
 # Changelog
 
+## v0.4.0 — 2026-07-02
+
+- **v2 fork-warming declared broken on Claude Code ≥ 2.1.198**: the system
+  prompt embeds a session-specific scratchpad path
+  (`/tmp/claude-<uid>/<project>/<SESSION-UUID>/scratchpad`), so a
+  `--fork-session` prefix can never match its parent's. Byte-level diff of
+  captured request bodies in docs/V3-DIAGNOSIS.md.
+- **New v3 replay architecture**: `prefix-proxy.js` (localhost logging proxy
+  on `ANTHROPIC_BASE_URL`, auth never persisted) + `replay-warmer.sh`
+  (replays each session's newest captured request byte-and-header-exact with
+  a fresh OAuth token) + `warm-replay.py`. Verified two consecutive warms:
+  `cache_read=71383, cache_creation=0`.
+- README banner warns v2 users; v3 install/tests/CI integration tracked in
+  BACKLOG.
+
 ## v0.3.3 — 2026-06-11
 
 - **Defensive keepalive re-submit** for busy / remote-control (`/rc`) sessions.
