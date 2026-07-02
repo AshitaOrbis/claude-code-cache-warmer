@@ -1,5 +1,35 @@
 # Changelog
 
+## v0.4.1 — 2026-07-02
+
+- **Fix: a transient replay failure no longer permanently breaks a session's
+  warm chain.** A failed replay (401/5xx/network) never touched the cache,
+  but it still burned `RATELIMIT_MIN` — pushing the retry past `WARM_MAX_AGE`,
+  so one blip inside the ~13-min warm window silently ended TTL refresh for
+  that session. Observed in production: OAuth access tokens live 8 h and
+  Claude Code refreshes them lazily, so a fully idle box sat unauthenticated
+  for ~45 min overnight and the two sids whose windows landed in the gap
+  dropped out of rotation. Failures now roll back `last_attempt` so the next
+  timer tick can retry inside the still-open window — at most 2 rollbacks per
+  failure streak (`<sid>.fail_count`), reset on any HTTP 200.
+- **Sync the externally-reviewed hardening** that was live in production but
+  missed the v0.4.0 push:
+  - `prefix-proxy.js`: captures land as `pending-*` temps and are promoted to
+    warmable `req-*` files only after upstream responds 2xx (an
+    unauthenticated local POST can no longer seed the warm queue);
+    `GET /warmer-health` serves a per-start nonce (mirrored 0600) so shell
+    init can verify it is talking to this proxy; broader credential-header
+    scrub (auth/token/secret/cookie/api-key/jwt/bearer); 0700 capture dir;
+    SSE-safe piping with upstream abort on client disconnect.
+  - `replay-warmer.sh`: refuse to replay captures declaring server-executed
+    tools (web_search / web_fetch / code_execution / hosted MCP — a replay
+    would re-run them on Anthropic infra); 0–44 s jitter between warms;
+    `PRUNE_HOURS` default 48 → 6.
+  - `warm-replay.py`: strip hop-by-hop + proxy-auth headers and reset
+    `x-stainless-retry-count` so warms don't masquerade as SDK retries.
+- config.example: document the v3 knobs (`MAX_CAPTURE_AGE_MIN`, `MIN_MSGS`,
+  `PRUNE_HOURS`).
+
 ## v0.4.0 — 2026-07-02
 
 - **v2 fork-warming declared broken on Claude Code ≥ 2.1.198**: the system

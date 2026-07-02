@@ -60,3 +60,12 @@ Deferred improvements from the 2026-06-11 GPT-5.5 Pro review
       revival path (requires ALL live sessions launched with it)
 - [ ] Capture-store hardening: per-session single-file rotation instead of
       accumulate-and-prune
+- [ ] ~~Proactive OAuth refresh in warm-replay.py~~ — DELIBERATELY DEFERRED
+      (2026-07-02): access tokens live 8 h and Claude Code refreshes them
+      lazily, so a fully idle box can sit unauthenticated (~45 min gap
+      observed; every warm in it 401s). Refreshing from the warmer risks
+      racing the CLI's own refresh-token rotation → full logout, which is
+      worse than a missed warm. The v0.4.1 rollback-retry covers short
+      blips; a token gap that long outlives the 1 h cache TTL anyway, so
+      those caches are unrecoverable regardless. Revisit only if that
+      calculus changes.

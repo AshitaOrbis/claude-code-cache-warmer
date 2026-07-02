@@ -63,3 +63,16 @@ FORK_RETENTION_DAYS=7
 
 # NOTE: this file is SOURCED as shell code by cache-warmer.sh on every run.
 # Keep it private (chmod 600) and put only KEY=value lines in it.
+
+# ---- v3 (replay-warmer.sh) knobs — ignored by the v2 fork engine ----
+
+# Stop warming once a session's newest captured request is older than this
+# (minutes). The capture is the replay source; past ~4 h the session is done.
+MAX_CAPTURE_AGE_MIN=240
+
+# Skip captures with fewer messages than this (filters one-shot `claude -p`).
+MIN_MSGS=3
+
+# Delete captures older than this (hours). Capture bodies hold conversation
+# content — keep the retention window short.
+PRUNE_HOURS=6

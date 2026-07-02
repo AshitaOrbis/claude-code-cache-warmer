@@ -46,7 +46,7 @@ EXCLUDE_SIDS=''
 INCLUDE_ONLY_SIDS=''
 MAX_CAPTURE_AGE_MIN=240
 MIN_MSGS=3
-PRUNE_HOURS=48
+PRUNE_HOURS=6   # captures are only warm-eligible for MAX_CAPTURE_AGE_MIN; don't retain bodies longer
 # shellcheck disable=SC1090
 [[ -f $CONFIG_FILE ]] && source "$CONFIG_FILE"
 # Env overrides (testing): CW_<KNOB>
@@ -60,6 +60,25 @@ done
 
 DRY=0; [[ ${1:-} == --dry-run ]] && DRY=1
 log() { printf '[%s] %s\n' "$(date '+%F %T')" "$*" >> "$LOG_FILE"; }
+
+# A failed replay (401/5xx/network) never touched the cache, so counting it
+# against RATELIMIT_MIN pushes the retry past WARM_MAX_AGE and permanently
+# breaks the sid's TTL chain (debug-20260702/FINDINGS.md, "Incident: 04:24
+# 401s"). Restore the pre-attempt last_attempt so the next timer tick can
+# retry while the warm window is still open — at most 2 rollbacks per failure
+# streak; the counter resets on any HTTP 200.
+note_fail() {
+  local sid=$1 prev=$2 fails=0
+  [[ -f $STATE_DIR/$sid.fail_count ]] && fails=$(<"$STATE_DIR/$sid.fail_count")
+  [[ $fails =~ ^[0-9]+$ ]] || fails=0
+  fails=$((fails + 1)); printf '%s' "$fails" > "$STATE_DIR/$sid.fail_count"
+  if (( fails <= 2 )); then
+    printf '%s' "$prev" > "$STATE_DIR/$sid.last_attempt"
+    log "RETRY sid=${sid:0:8}: rolled back last_attempt (fail #$fails) — next tick may retry"
+  else
+    log "GIVEUP sid=${sid:0:8}: fail #$fails — keeping rate-limit cooldown"
+  fi
+}
 
 if (( ENABLED != 1 )); then exit 0; fi
 
@@ -101,6 +120,19 @@ for sid in "${!NEWEST_FILE[@]}"; do
   msgs=$(jq -r '.messages | length' "$f" 2>/dev/null) || msgs=0
   if (( msgs < MIN_MSGS )); then continue; fi
 
+  # SERVER-executed tools (web_search, web_fetch, code_execution, hosted MCP)
+  # would be re-run on Anthropic's infrastructure by a replay — refuse to warm
+  # such captures (GPT-5.5-Pro review P0).
+  server_tools=$(jq -r '
+      ([.tools // [] | .[] | .type // ""]
+       | map(select(test("web_search|web_fetch|code_execution")))
+       | length)
+      + (if .mcp_servers then 1 else 0 end)' "$f" 2>/dev/null) || server_tools=1
+  if [[ ! $server_tools =~ ^[0-9]+$ ]] || (( server_tools > 0 )); then
+    log "skip sid=${sid:0:8}: capture declares server-side tools (replay would re-execute them)"
+    continue
+  fi
+
   last_warm=0; [[ -f $STATE_DIR/${sid}.last_warm ]] && last_warm=$(<"$STATE_DIR/${sid}.last_warm")
   [[ $last_warm =~ ^[0-9]+$ ]] || last_warm=0
   last_attempt=0; [[ -f $STATE_DIR/${sid}.last_attempt ]] && last_attempt=$(<"$STATE_DIR/${sid}.last_attempt")
@@ -117,12 +149,15 @@ for sid in "${!NEWEST_FILE[@]}"; do
   fi
 
   printf '%s' "$now" > "$STATE_DIR/${sid}.last_attempt"
+  sleep $(( RANDOM % 45 ))   # jitter so multi-session warms don't fire as a burst
   log "WARM sid=${sid:0:8} age=${age_min}m cap-age=${cap_age_min}m msgs=$msgs (replay $(basename "$f"))"
   result=$(python3 "$SCRIPT_DIR/warm-replay.py" "$f" "${f%.json}.hdrs.json" 2>>"$LOG_FILE") || {
     log "RESULT sid=${sid:0:8} FAIL: $(printf '%s' "$result" | head -c 300)"
+    note_fail "$sid" "$last_attempt"
     continue
   }
   http=$(jq -r '.http // 0' <<<"$result")
+  (( http == 200 )) && rm -f "$STATE_DIR/${sid}.fail_count"
   c_read=$(jq -r '.cache_read // 0' <<<"$result")
   c_create=$(jq -r '.cache_creation // 0' <<<"$result")
   if (( http == 200 && c_read > 0 && c_create * 4 < c_read )); then
@@ -140,5 +175,6 @@ for sid in "${!NEWEST_FILE[@]}"; do
     fi
   else
     log "RESULT sid=${sid:0:8} FAIL http=$http: $(printf '%s' "$result" | head -c 300)"
+    note_fail "$sid" "$last_attempt"
   fi
 done

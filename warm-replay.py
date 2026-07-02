@@ -18,8 +18,14 @@ def main():
     creds = os.path.expanduser('~/.claude/.credentials.json')
     tok = json.load(open(creds))['claudeAiOauth']['accessToken']
 
-    headers = {k: v for k, v in meta['headers'].items()
-               if k.lower() not in ('host', 'content-length', 'connection', 'accept-encoding')}
+    # Strip hop-by-hop + stale-length headers; keep the semantic set (betas,
+    # version, user-agent, x-app, x-claude-code-session-id). Retry telemetry is
+    # reset so scheduled warms don't masquerade as SDK retries.
+    drop = ('host', 'content-length', 'connection', 'accept-encoding', 'keep-alive',
+            'transfer-encoding', 'te', 'trailer', 'upgrade', 'proxy-authorization',
+            'proxy-authenticate', 'x-stainless-retry-count')
+    headers = {k: v for k, v in meta['headers'].items() if k.lower() not in drop}
+    headers['x-stainless-retry-count'] = '0'
     headers['Authorization'] = f'Bearer {tok}'
     headers['accept-encoding'] = 'identity'
 
