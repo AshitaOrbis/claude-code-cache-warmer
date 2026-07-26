@@ -5,6 +5,12 @@ on:
     branches: [master, main]
   pull_request:
 
+# Lint and tests only read the tree. Declared explicitly so the job keeps a
+# read-only GITHUB_TOKEN even if the repo/org default is ever widened
+# (gh audit 2026-07-26, F5).
+permissions:
+  contents: read
+
 jobs:
   lint-and-test:
     runs-on: ubuntu-latest
@@ -31,10 +37,16 @@ jobs:
       # shfmt format check on the files this repo formats with shfmt (lib/ +
       # tests/). cache-warmer.sh / install.sh predate shfmt adoption and use an
       # aligned-comment style shfmt would collapse, so they are not gated here.
+      # The binary is fetched from a GitHub release, so verify it before running it:
+      # a release asset can be replaced by whoever controls the upstream repo, and
+      # this step executes it as root on the runner (gh audit 2026-07-26, F6). The
+      # hash below is mvdan/sh's own published sha256sums.txt for v3.8.0.
       - name: shfmt (format check)
         run: |
-          curl -fsSL https://github.com/mvdan/sh/releases/download/v3.8.0/shfmt_v3.8.0_linux_amd64 -o /usr/local/bin/shfmt
-          chmod +x /usr/local/bin/shfmt
+          SHFMT_SHA256=27b3c6f9d9592fc5b4856c341d1ff2c88856709b9e76469313642a1d7b558fe0
+          curl -fsSL https://github.com/mvdan/sh/releases/download/v3.8.0/shfmt_v3.8.0_linux_amd64 -o /tmp/shfmt
+          echo "${SHFMT_SHA256}  /tmp/shfmt" | sha256sum -c -
+          sudo install -m 0755 /tmp/shfmt /usr/local/bin/shfmt
           shfmt --version
           shfmt -i 2 -ci -d lib/classify.sh tests/run.sh
 
