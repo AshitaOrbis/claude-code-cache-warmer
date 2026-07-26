@@ -70,7 +70,7 @@ and the no-identification path (`fork_jsonl` never set when `match_count != 1`) 
 local project_dir="$HOME/.claude/projects/${cwd//\//-}"
 ```
 
-**Empirical (confirmed):** `~/.claude/projects/` on the dev machine contains `-home-ashita--claude-plugins-marketplaces-claude-plugins-official`, i.e. `/home/ashita/.claude/plugins/...` with `.` → `-`. Additionally, zero of 100+ project dir names contain `_` while underscore paths exist in the workspace — Claude Code almost certainly sanitizes every non-alphanumeric character to `-`, not just `/`.
+**Empirical (confirmed):** `~/.claude/projects/` on the dev machine contains `-home-<user>--claude-plugins-marketplaces-claude-plugins-official`, i.e. `/home/<user>/.claude/plugins/...` with `.` → `-`. Additionally, zero of 100+ project dir names contain `_` while underscore paths exist in the workspace — Claude Code almost certainly sanitizes every non-alphanumeric character to `-`, not just `/`.
 
 **Failure scenario A (dir-scan candidates):** a user works in `/home/u/myapp.web`. The computed `project_dir` does not exist, `[[ -d $project_dir ]]` (line 495) fails, and the session is silently never discovered. The tool quietly does nothing for every dotted project — a very common path shape — with no log line.
 
