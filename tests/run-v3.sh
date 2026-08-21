@@ -342,8 +342,8 @@ assert_eq "ExecStart runs the node proxy with port and capture dir" "yes" \
       <<<"$proxy_unit" && echo yes || echo no)"
 assert_eq "proxy is supervised, not oneshot" "yes" \
   "$(grep -q '^Restart=always' <<<"$proxy_unit" && echo yes || echo no)"
-assert_eq "retention window reaches the proxy" "yes" \
-  "$(grep -q '^Environment=CW_PRUNE_HOURS=6' <<<"$proxy_unit" && echo yes || echo no)"
+assert_eq "retention window reaches the proxy (quoted — see sol-5)" "yes" \
+  "$(grep -qF 'Environment="CW_PRUNE_HOURS=6"' <<<"$proxy_unit" && echo yes || echo no)"
 
 warmer_v3=$(render_warmer_service /bin/bash /opt/cw/replay-warmer.sh /usr/bin v3)
 assert_eq "v3 warmer unit runs replay-warmer.sh" "yes" \
@@ -605,7 +605,7 @@ assert_eq "the warmer reads CW_CAPTURE_DIR too" "yes" \
   "$(grep -q 'CAP_DIR=${CW_CAPTURE_DIR:-\$CAPTURE_DIR}' "$REPO_DIR/replay-warmer.sh" && echo yes || echo no)"
 assert_eq "and install.sh bakes it into the warmer unit" "yes" \
   "$(render_warmer_service /bin/bash /opt/cw/replay-warmer.sh /usr/bin v3 /home/u/.cache/prefix-proxy \
-     | grep -q '^Environment=CW_CAPTURE_DIR=/home/u/.cache/prefix-proxy$' && echo yes || echo no)"
+     | grep -qF 'Environment="CW_CAPTURE_DIR=/home/u/.cache/prefix-proxy"' && echo yes || echo no)"
 
 describe "bq-318 proxy startup: an unwritable store is fatal, not silent"
 RO="$WORK/readonly-store"
@@ -723,6 +723,103 @@ assert_eq "the malformed capture was skipped" "no" \
   "$(grep -q 'req-malformed-000-msg' "$STAGE/calls.log" 2>/dev/null && echo yes || echo no)"
 assert_eq "the healthy capture beside it was still warmed" "yes" \
   "$(grep -q 'req-good-001-msg' "$STAGE/calls.log" && echo yes || echo no)"
+
+# ---------------------------------------------------------------------------
+# Sol review, 2026-08-21 — five defects found in the drain itself. Each one is
+# a way a FIX for a finding reintroduced a version of the problem it closed.
+# ---------------------------------------------------------------------------
+describe "sol-1 MIN_MSGS: jq iterates an object's VALUES, so .messages must be an array"
+# Behavioural, not string-scraped: a body whose .messages is an OBJECT of three
+# user-shaped values counted three human turns and was warmed. It must not be.
+H="$WORK/home-jqobj"
+CAP="$H/.cache/prefix-proxy"
+OBJ=cdcdcdcd-1111-2222-3333-444444444444
+mkdir -p "$CAP"
+jq -nc --arg sp "/tmp/claude-1000/proj/$OBJ/scratchpad" '{
+  model: "claude-opus-5", max_tokens: 32000,
+  system: [{type: "text", text: ("Scratchpad Directory\n" + $sp)}],
+  messages: {a: {role:"user",content:"1"}, b: {role:"user",content:"2"}, c: {role:"user",content:"3"}}
+}' > "$CAP/req-objmsgs-000-msg.json"
+jq -nc '{url:"/v1/messages",headers:{}}' > "$CAP/req-objmsgs-000-msg.hdrs.json"
+touch -d '50 minutes ago' "$CAP/req-objmsgs-000-msg.json" "$CAP/req-objmsgs-000-msg.hdrs.json"
+make_capture "$CAP" "req-realarray-001-msg" cecececd-1111-2222-3333-444444444444 50
+STAGE="$WORK/stage-jqobj"
+mkdir -p "$STAGE"
+cp "$REPO_DIR/replay-warmer.sh" "$STAGE/"
+stub_warm_replay "$STAGE" '{"http":200,"cache_read":71410,"cache_creation":0,"output_tokens":1}'
+HOME="$H" CW_CONFIG="$WORK/config-clock" bash "$STAGE/replay-warmer.sh"
+assert_eq "an OBJECT of user-shaped values is NOT warmed" "no" \
+  "$(grep -q 'req-objmsgs-000-msg' "$STAGE/calls.log" 2>/dev/null && echo yes || echo no)"
+assert_eq "a genuine array beside it still is (positive control)" "yes" \
+  "$(grep -q 'req-realarray-001-msg' "$STAGE/calls.log" && echo yes || echo no)"
+
+describe "sol-2 shell guard: fails CLOSED — the old README snippet fired on empty==empty"
+guard() {
+  env -u ANTHROPIC_BASE_URL CW_PROXY_PORT="$1" CW_CAPTURE_DIR="$2" \
+    bash -c 'source "$0"; echo "${ANTHROPIC_BASE_URL:-unset}"' "$REPO_DIR/shell-guard.sh"
+}
+assert_eq "proxy down AND nonce absent (the exact fail-open) -> unset" "unset" \
+  "$(guard 59999 /nonexistent)"
+NONCEDIR="$WORK/nonce"
+mkdir -p "$NONCEDIR"
+: > "$NONCEDIR/.health-nonce"
+assert_eq "an EMPTY nonce file can never authenticate -> unset" "unset" \
+  "$(guard 59999 "$NONCEDIR")"
+printf 'realnonce' > "$NONCEDIR/.health-nonce"
+assert_eq "nonce present but proxy down -> unset" "unset" \
+  "$(guard 59999 "$NONCEDIR")"
+# A squatter that answers 200 with the WRONG body must not capture the session.
+python3 -c '
+import http.server, threading, sys
+class H(http.server.BaseHTTPRequestHandler):
+    def do_GET(s):
+        s.send_response(200); s.end_headers(); s.wfile.write(b"squatter")
+    def log_message(s, *a): pass
+srv = http.server.HTTPServer(("127.0.0.1", 0), H)
+open(sys.argv[1], "w").write(str(srv.server_port))
+srv.serve_forever()
+' "$WORK/squat.port" &
+SQUAT=$!
+while [[ ! -s $WORK/squat.port ]]; do sleep 0.05; done
+assert_eq "a squatter answering 200 with the wrong body -> unset" "unset" \
+  "$(guard "$(cat "$WORK/squat.port")" "$NONCEDIR")"
+kill "$SQUAT" 2>/dev/null || true
+
+describe "sol-3 proxy: an upstream stream error must not be an uncaught exception"
+assert_eq "the upstream response has an error handler" "yes" \
+  "$(grep -q "pres.on('error'" "$REPO_DIR/prefix-proxy.js" && echo yes || echo no)"
+assert_eq "so does the client response" "yes" \
+  "$(grep -q "res.on('error'" "$REPO_DIR/prefix-proxy.js" && echo yes || echo no)"
+assert_status "an unhandled 'error' on a piped stream really does kill a node process" 1 \
+  node -e 'const {Readable,Writable}=require("stream");
+    const r=new Readable({read(){}}), w=new Writable({write(c,e,cb){cb()}});
+    r.pipe(w); r.emit("error", new Error("upstream reset"));'
+
+describe "sol-4 proxy health: the degraded latch must be able to CLEAR itself"
+L="$WORK/latch"
+mkdir -p "$L"
+assert_eq "storeWritable is true on a writable store" "true" \
+  "$(node -e 'console.log(require(process.argv[1]).storeWritable(process.argv[2]))' "$REPO_DIR/prefix-proxy.js" "$L")"
+chmod 0500 "$L"
+assert_eq "and false on an unwritable one, without throwing" "false" \
+  "$(node -e 'console.log(require(process.argv[1]).storeWritable(process.argv[2]))' "$REPO_DIR/prefix-proxy.js" "$L")"
+chmod 0700 "$L"
+assert_eq "the sweep clears writeErrors when the store recovers" "yes" \
+  "$(grep -q 'clearing degraded state' "$REPO_DIR/prefix-proxy.js" && echo yes || echo no)"
+
+describe "sol-5 units: Environment= splits on whitespace, so its values need quoting too"
+u=$(render_warmer_service /bin/bash "/opt/my repo/replay-warmer.sh" "/usr/bin:/opt/my bin" v3 "/tmp/capture dir")
+assert_eq "a capture dir with a space stays ONE assignment" "yes" \
+  "$(grep -qF 'Environment="CW_CAPTURE_DIR=/tmp/capture dir"' <<<"$u" && echo yes || echo no)"
+assert_eq "so does a PATH with a space" "yes" \
+  "$(grep -qF 'Environment="PATH=/usr/bin:/opt/my bin"' <<<"$u" && echo yes || echo no)"
+assert_eq "no bare unquoted Environment= line survives" "0" \
+  "$(grep -c '^Environment=[^"]' <<<"$u" || true)"
+assert_eq "v2 omits the capture dir entirely" "0" \
+  "$(render_warmer_service /bin/bash /opt/cw/cache-warmer.sh /usr/bin v2 | grep -c 'CW_CAPTURE_DIR' || true)"
+assert_eq "the proxy unit quotes its value too" "yes" \
+  "$(render_proxy_unit /usr/bin/node /opt/p.js 8377 "/tmp/capture dir" 6 \
+     | grep -qF 'Environment="CW_PRUNE_HOURS=6"' && echo yes || echo no)"
 
 # ---------------------------------------------------------------------------
 printf '\n----------------------------------------\n'

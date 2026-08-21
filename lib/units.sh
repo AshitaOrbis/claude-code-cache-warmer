@@ -47,8 +47,14 @@ v2_supported() {
 }
 
 # systemd_quote <path> -> the path with the two characters systemd treats as
-# special inside double quotes escaped, so ExecStart can wrap it in quotes and
+# special inside double quotes escaped, so a directive can wrap it in quotes and
 # survive spaces and metacharacters.
+#
+# This applies to Environment= just as much as to ExecStart=. Environment takes
+# SPACE-SEPARATED assignments, so an unquoted value containing a space parses as
+# a truncated assignment plus a malformed bare token — a capture directory with
+# a space silently resolved to the WRONG path in the warmer unit, which is the
+# very proxy/warmer divergence bq-318 exists to prevent (Sol review 2026-08-21).
 systemd_quote() {
   local p=$1
   p=${p//\\/\\\\} # backslash first
@@ -67,7 +73,7 @@ After=default.target
 [Service]
 Type=simple
 ExecStart=$node_bin "$(systemd_quote "$script")" $port "$(systemd_quote "$capdir")"
-Environment=CW_PRUNE_HOURS=$prune
+Environment="CW_PRUNE_HOURS=$prune"
 Restart=always
 RestartSec=2
 Nice=5
@@ -84,6 +90,14 @@ render_warmer_service() {
   local bash_bin=$1 script=$2 unit_path=$3 engine=${4:-v3} capdir=${5:-}
   local desc="Claude Code prompt-cache warmer (v3 replay)"
   [[ $engine == v2 ]] && desc="Claude Code prompt-cache warmer (v2 fork-based keepalive)"
+  # Built before the heredoc, not inside a ${var:+...} expansion: the quotes are
+  # the whole point of this directive and an expansion swallowed them.
+  local env_lines
+  env_lines='Environment="ENABLE_PROMPT_CACHING_1H=1"'
+  env_lines+=$'\n'"Environment=\"PATH=$(systemd_quote "$unit_path")\""
+  if [[ -n $capdir ]]; then
+    env_lines+=$'\n'"Environment=\"CW_CAPTURE_DIR=$(systemd_quote "$capdir")\""
+  fi
   cat <<UNIT
 [Unit]
 Description=$desc
@@ -92,9 +106,7 @@ After=default.target
 [Service]
 Type=oneshot
 ExecStart=$bash_bin "$(systemd_quote "$script")"
-Environment=ENABLE_PROMPT_CACHING_1H=1
-Environment=PATH=$unit_path${capdir:+
-Environment=CW_CAPTURE_DIR=$capdir}
+$env_lines
 Nice=10
 IOSchedulingClass=best-effort
 IOSchedulingPriority=7

@@ -68,6 +68,19 @@ function pruneHours(env) {
 // Create the store if absent and enforce 0700 EVERY start — mkdir's `mode`
 // is ignored when the directory already exists, so a store created once with
 // a loose umask stayed loose forever.
+// Non-throwing writability probe, used both at startup and by the recovery
+// sweep. Separate from ensureStore because the sweep must never throw.
+function storeWritable(logdir) {
+  const probe = path.join(logdir, `.write-probe-${process.pid}`);
+  try {
+    fs.writeFileSync(probe, 'x', { mode: 0o600 });
+    fs.unlinkSync(probe);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 function ensureStore(logdir) {
   fs.mkdirSync(logdir, { recursive: true, mode: 0o700 });
   fs.chmodSync(logdir, 0o700);
@@ -210,12 +223,25 @@ function createProxyServer(logdir, nonce, state = newHealthState()) {
         (pres) => {
           if (pres.statusCode >= 200 && pres.statusCode < 300) promote(); else discard();
           res.writeHead(pres.statusCode, pres.headers);
+          // An 'error' event with no listener is an UNCAUGHT exception, and this
+          // process is a long-lived server: an upstream reset mid-response took
+          // the whole proxy down, which takes every routed session with it
+          // (Sol review, 2026-08-21). Headers are already sent by here, so the
+          // only honest move is to drop the connection.
+          pres.on('error', (e) => {
+            console.error(`prefix-proxy: upstream stream error: ${e.message}`);
+            res.destroy(e);
+          });
           pres.pipe(res);
         }
       );
       preq.on('error', (e) => {
         discard();
         try { res.writeHead(502, { 'content-type': 'text/plain' }); res.end('proxy error: ' + e.message); } catch {}
+      });
+      res.on('error', (e) => {
+        console.error(`prefix-proxy: client stream error: ${e.message}`);
+        preq.destroy();
       });
       res.on('close', () => { if (pending) discard(); preq.destroy(); });
       preq.end(body);
@@ -243,6 +269,17 @@ function main(argv, env) {
   const sweep = () => {
     const removed = pruneCaptures(logdir, maxAgeMs);
     if (removed) console.log(`prefix-proxy: pruned ${removed} capture file(s) older than ${maxAgeMs / 3600000}h`);
+    // Clear the degraded latch when the store is demonstrably writable again.
+    // Without this the 503 is SELF-PERPETUATING: /warmer-health 503s -> the
+    // shell guard stops routing new sessions -> no session produces a capture
+    // -> promote() never runs -> writeErrors never resets. That is exactly the
+    // deadlock argued against for `no_capture_yet`, and it applied just as
+    // hard to `capture_write_failed` (Sol review, 2026-08-21).
+    if (state.writeErrors > 0 && storeWritable(logdir)) {
+      console.log('prefix-proxy: capture store is writable again — clearing degraded state');
+      state.writeErrors = 0;
+      state.lastError = null;
+    }
   };
   sweep();
   setInterval(sweep, PRUNE_INTERVAL_MS);
@@ -253,8 +290,8 @@ function main(argv, env) {
 }
 
 module.exports = {
-  defaultLogdir, resolveLogdir, pruneHours, ensureStore, pruneCaptures,
-  createProxyServer, newHealthState, healthReport, CAPTURE_RE,
+  defaultLogdir, resolveLogdir, pruneHours, ensureStore, storeWritable,
+  pruneCaptures, createProxyServer, newHealthState, healthReport, CAPTURE_RE,
 };
 
 if (require.main === module) main(process.argv, process.env);

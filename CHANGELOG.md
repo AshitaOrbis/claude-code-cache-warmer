@@ -51,6 +51,27 @@ CI alongside shellcheck for `replay-warmer.sh` and `lib/units.sh`.
   headless `claude -p` job that made two tool calls cleared the gate that is
   documented as filtering exactly those. It now mirrors `lib/jsonl.py`'s
   real-user predicate.
+Five further defects were found by a GPT-5.6-Sol review OF this pass, and each
+one was a fix reintroducing a version of the problem it closed:
+
+- **The `.bashrc` guard failed OPEN.** It compared `curl` output against `cat`
+  output; with the proxy down curl prints nothing, and with the nonce file
+  absent or relocated cat prints nothing, so empty matched empty and every
+  session in that shell was pointed at a dead proxy. It is now `shell-guard.sh`
+  — a tested file, not a README snippet — and requires a non-empty nonce.
+- **An upstream stream error crashed the proxy.** `pres.pipe(res)` had no
+  `error` listener, and an `error` event without one is an uncaught exception in
+  a long-lived server.
+- **The degraded latch could not clear.** `/warmer-health` 503s on write
+  failure, the guard then stops routing sessions, so no capture is produced and
+  `writeErrors` never resets — the same deadlock the design already rejected for
+  `no_capture_yet`. A writability probe on the retention timer clears it.
+- **`Environment=` values were unquoted.** systemd splits that directive on
+  whitespace, so a capture directory containing a space became a truncated
+  assignment plus a stray token — reintroducing the proxy/warmer divergence.
+- **The human-turn count accepted a non-array.** jq iterates an object's values,
+  so `{"messages":{...}}` counted three turns off a body with no messages array.
+
 - **Strict argument parsing.** `--dryrun`, `--dry-run=true` or any other typo
   ran a LIVE warm; even the correct flag pruned captures before printing
   anything. Unknown arguments now exit 2 before any side effect, and a valid

@@ -229,13 +229,17 @@ for sid in "${!NEWEST_FILE[@]}"; do
   # gate that docs/V3-DIAGNOSIS.md claims filters exactly those captures. The
   # predicate mirrors lib/jsonl.py's `_is_real_user_text`: role user, and
   # content that is either plain text or a block list carrying no tool_result.
+  # The array type-check is load-bearing: jq iterates an OBJECT's values too, so
+  # `{"messages":{"a":{"role":"user"...},"b":...}}` counted three human turns off
+  # a body that has no messages array at all (Sol review, 2026-08-21).
   msgs=$(jq -r '
-      [ (.messages // [])[]
-        | select(.role == "user")
+      if (.messages | type) != "array" then 0 else
+      [ .messages[]
+        | select(type == "object" and .role == "user")
         | select((.content | type) == "string"
                  or ([ (.content // [])[]
                        | select(type == "object" and .type == "tool_result") ] | length) == 0)
-      ] | length' "$f" 2>/dev/null) || msgs=0
+      ] | length end' "$f" 2>/dev/null) || msgs=0
   [[ $msgs =~ ^[0-9]+$ ]] || msgs=0
   if (( msgs < MIN_MSGS )); then continue; fi
 

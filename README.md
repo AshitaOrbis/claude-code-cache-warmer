@@ -131,15 +131,24 @@ a prior capture would deadlock a fresh install. Monitor the JSON endpoint.
 
 Only sessions launched **through the proxy** are warmable — v3 replays a real
 captured request, so a session that never went through it has nothing to
-replay. Guard the export so a proxy that is down fails open:
+replay. Source the guard rather than hand-rolling one:
 
 ```bash
 # ~/.bashrc
-if [ "$(curl -fs --max-time 1 http://127.0.0.1:8377/warmer-health 2>/dev/null)" \
-     = "$(cat ~/.cache/prefix-proxy/.health-nonce 2>/dev/null)" ]; then
-  export ANTHROPIC_BASE_URL=http://127.0.0.1:8377
-fi
+source /path/to/claude-code-cache-warmer/shell-guard.sh
 ```
+
+`shell-guard.sh` exports `ANTHROPIC_BASE_URL` only when the nonce file is
+non-empty AND the proxy echoes that exact value — so a proxy that is down, a
+missing nonce, a relocated `CW_CAPTURE_DIR`, or a squatter on the port all leave
+your sessions talking to api.anthropic.com directly: unwarmable, but working.
+
+This used to be a snippet in this README, and it compared `curl` output against
+`cat` output directly. With the proxy down curl prints nothing; with the nonce
+file absent — or merely somewhere else, since `CW_CAPTURE_DIR` is configurable
+and the snippet hard-coded the default — cat prints nothing. Empty matched
+empty, the guard fired, and every session in that shell was pointed at a dead
+proxy and could not reach the API at all. It is a tested file now.
 
 ### Install (v2 fork engine — legacy)
 
