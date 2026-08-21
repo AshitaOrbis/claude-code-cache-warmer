@@ -96,6 +96,25 @@ for _n in ENABLED WARM_MIN_AGE WARM_MAX_AGE RATELIMIT_MIN MISMATCH_COOLDOWN_DAYS
   [[ ${!_n} =~ ^[0-9]+$ ]] || { echo "config error: $_n must be an integer (got '${!_n}')" >&2; exit 2; }
 done
 [[ -n ${CW_INCLUDE_ONLY_SIDS:-} ]] && INCLUDE_ONLY_SIDS=$CW_INCLUDE_ONLY_SIDS
+[[ -n ${CW_EXCLUDE_SIDS:-} ]] && EXCLUDE_SIDS=$CW_EXCLUDE_SIDS
+
+# Validate both session-id regexes at startup, exactly as the v2 engine does
+# (cache-warmer.sh:72-83), and BEFORE pruning or replaying anything (bq-316).
+# Bash's `=~` returns status 2 when the pattern does not COMPILE and 1 when it
+# compiles but does not match. Inside `if [[ ... ]]` both read as "false", so a
+# malformed EXCLUDE_SIDS silently became "excludes nothing" and the warmer
+# replayed the very sessions the operator had ruled out — a fail-OPEN on a knob
+# whose only purpose is to keep a session's conversation off the wire.
+for _re in EXCLUDE_SIDS INCLUDE_ONLY_SIDS; do
+  if [[ -n ${!_re} ]]; then
+    _st=0
+    # SC2319: capturing the [[ ]] regex-compile status is exactly the intent —
+    # status 2 means the regex itself is invalid (vs 1 = valid but no match).
+    # shellcheck disable=SC2319
+    [[ "x" =~ ${!_re} ]] || _st=$?
+    (( _st >= 2 )) && { echo "config error: $_re is not a valid regex" >&2; exit 2; }
+  fi
+done
 
 log() { printf '[%s] %s\n' "$(date '+%F %T')" "$*" >> "$LOG_FILE"; }
 

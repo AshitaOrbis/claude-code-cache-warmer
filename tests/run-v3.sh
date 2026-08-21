@@ -388,6 +388,46 @@ assert_eq "aged-out capture pruned on a real run" "no" \
   "$([[ -f $CAP/req-stale-000-msg.json ]] && echo yes || echo no)"
 
 # ---------------------------------------------------------------------------
+# bq-316 — a malformed session-id regex must fail CLOSED. Bash's `=~` returns
+# 2 for "does not compile" and 1 for "compiles, no match", and inside an `if`
+# both read as false — so a typo'd EXCLUDE_SIDS silently excluded nothing.
+# ---------------------------------------------------------------------------
+describe "bq-316 regex gate: a malformed exclude regex exits 2 and replays nothing"
+H="$WORK/home-regex"
+CAP="$H/.cache/prefix-proxy"
+SID=aaaaaaaa-1111-2222-3333-444444444444
+make_capture "$CAP" "req-warmable-000-msg" "$SID" 50
+make_capture "$CAP" "req-stale-001-msg" bbbbbbbb-1111-2222-3333-444444444444 600
+STAGE="$WORK/stage-regex"
+mkdir -p "$STAGE"
+cp "$REPO_DIR/replay-warmer.sh" "$STAGE/"
+stub_warm_replay "$STAGE" '{"http":200,"cache_read":71410,"cache_creation":0,"output_tokens":1}'
+printf 'ENABLED=1\n' > "$WORK/config-regex"
+
+assert_status "malformed EXCLUDE_SIDS exits 2" 2 \
+  env HOME="$H" CW_CONFIG="$WORK/config-regex" CW_EXCLUDE_SIDS='^(abc' \
+  bash "$STAGE/replay-warmer.sh"
+assert_eq "zero replay calls on a malformed exclude" "no" \
+  "$([[ -f $STAGE/calls.log ]] && echo yes || echo no)"
+assert_eq "and it exited BEFORE pruning" "yes" \
+  "$([[ -f $CAP/req-stale-001-msg.json ]] && echo yes || echo no)"
+
+assert_status "malformed INCLUDE_ONLY_SIDS exits 2 as well" 2 \
+  env HOME="$H" CW_CONFIG="$WORK/config-regex" CW_INCLUDE_ONLY_SIDS='a{2,1}' \
+  bash "$STAGE/replay-warmer.sh"
+assert_eq "still zero replay calls" "no" \
+  "$([[ -f $STAGE/calls.log ]] && echo yes || echo no)"
+
+describe "bq-316 regex gate: a VALID exclude still excludes, and a valid config still warms"
+HOME="$H" CW_CONFIG="$WORK/config-regex" CW_EXCLUDE_SIDS="^${SID%%-*}" \
+  bash "$STAGE/replay-warmer.sh"
+assert_eq "a well-formed exclude keeps the session off the wire" "no" \
+  "$([[ -f $STAGE/calls.log ]] && echo yes || echo no)"
+HOME="$H" CW_CONFIG="$WORK/config-regex" bash "$STAGE/replay-warmer.sh"
+assert_eq "with no exclude, the same session IS warmed (positive control)" "yes" \
+  "$([[ -f $STAGE/calls.log ]] && echo yes || echo no)"
+
+# ---------------------------------------------------------------------------
 printf '\n----------------------------------------\n'
 printf 'v3: Passed: %d   Failed: %d\n' "$PASS" "$FAIL"
 ((FAIL == 0))
