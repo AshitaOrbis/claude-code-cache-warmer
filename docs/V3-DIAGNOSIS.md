@@ -36,7 +36,11 @@ Don't reconstruct the prefix — **replay the session's own last request**:
 1. `prefix-proxy.service` (node, 127.0.0.1:8377) forwards to
    api.anthropic.com and captures each /v1/messages request body + headers
    (Authorization/cookie/x-api-key never persisted) to `~/.cache/prefix-proxy/`
-   (mode 600/700, pruned after 48h).
+   (mode 600/700; pruned after `PRUNE_HOURS`, default **6 h**). Retention is
+   enforced by the proxy itself — at startup and every 10 min, over both
+   promoted `req-*` and crash-leftover `pending-*` pairs — so capture bodies
+   are bounded even when the warmer is disabled or never runs (bq-314).
+   `replay-warmer.sh` sweeps the same store as a second pass.
 2. Sessions opt in via `ANTHROPIC_BASE_URL=http://127.0.0.1:8377` — exported
    by `~/.bashrc` only when the proxy port answers (fail-open if down).
 3. `replay-warmer.sh` (cache-warmer.service now points here) groups captures

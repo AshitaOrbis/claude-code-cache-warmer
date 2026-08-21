@@ -24,13 +24,16 @@
 # v3-specific knobs (config or CW_*-prefixed env overrides for testing):
 #   MAX_CAPTURE_AGE_MIN (240)  stop warming once the last real request is old
 #   MIN_MSGS (3)               skip one-shot `claude -p` captures
-#   PRUNE_HOURS (48)           delete captures older than this
+#   PRUNE_HOURS (6)            delete captures older than this (also
+#                              enforced by prefix-proxy.js, independent of ENABLED)
 #
 # Usage: replay-warmer.sh [--dry-run]
 set -euo pipefail
 
 SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
-CONFIG_FILE="$SCRIPT_DIR/config"
+# CW_CONFIG lets the test suite point at a hermetic config instead of the
+# maintainer's real one (which is gitignored and box-specific).
+CONFIG_FILE=${CW_CONFIG:-"$SCRIPT_DIR/config"}
 LOG_FILE="$HOME/.claude/logs/cache-warmer.log"
 STATE_DIR="$HOME/.cache/cache-warmer-v3"
 CAP_DIR="$HOME/.cache/prefix-proxy"
@@ -80,10 +83,20 @@ note_fail() {
   fi
 }
 
-if (( ENABLED != 1 )); then exit 0; fi
+# Prune old captures (bodies hold conversation content — keep the window
+# short). This runs BEFORE the ENABLED gate and matches BOTH capture prefixes:
+# promoted `req-*` and crash-leftover `pending-*` (bq-314). Retention that only
+# ran when warming was enabled left full conversations on disk indefinitely on
+# any box where the operator set ENABLED=0. prefix-proxy.js sweeps the same
+# store on its own timer, so retention survives this script never running at
+# all; this pass is the belt to the proxy's braces.
+prune_captures() {
+  find "$CAP_DIR" -maxdepth 1 \( -name 'req-*' -o -name 'pending-*' \) \
+    -mmin +$(( PRUNE_HOURS * 60 )) -delete 2>/dev/null || true
+}
+prune_captures
 
-# Prune old captures (bodies hold conversation content — keep the window short).
-find "$CAP_DIR" -maxdepth 1 -name 'req-*' -mmin +$(( PRUNE_HOURS * 60 )) -delete 2>/dev/null || true
+if (( ENABLED != 1 )); then exit 0; fi
 
 now=$(date +%s)
 declare -A NEWEST_FILE NEWEST_MTIME

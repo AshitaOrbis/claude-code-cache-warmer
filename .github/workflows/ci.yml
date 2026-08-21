@@ -32,7 +32,8 @@ jobs:
           sudo apt-get install -y -qq shellcheck
           shellcheck --version
           shellcheck -x --severity=warning \
-            cache-warmer.sh install.sh lib/classify.sh tests/run.sh
+            cache-warmer.sh install.sh lib/classify.sh tests/run.sh \
+            replay-warmer.sh tests/run-v3.sh
 
       # shfmt format check on the files this repo formats with shfmt (lib/ +
       # tests/). cache-warmer.sh / install.sh predate shfmt adoption and use an
@@ -59,3 +60,9 @@ jobs:
       # Never forks a live Claude session — pure fixture-driven logic.
       - name: Run tests
         run: bash tests/run.sh
+
+      # v3 (replay engine) suite: proxy retention, warmer gating, arg parsing,
+      # replay body-capping. Hermetic — temp HOME, stub replay, local fake SSE
+      # server; never calls Anthropic and never runs install.sh.
+      - name: Run v3 tests
+        run: bash tests/run-v3.sh
