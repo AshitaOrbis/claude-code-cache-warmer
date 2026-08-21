@@ -668,6 +668,63 @@ assert_status "a mixed store exits 0" 0 \
   env HOME="$H" CW_CONFIG="$WORK/config-store" bash "$REPO_DIR/replay-warmer.sh"
 
 # ---------------------------------------------------------------------------
+# Cross-cutting: the bq-317 clock change touches note_fail's rollback, and the
+# bq-319 predicate has to survive a malformed capture. Neither is a finding of
+# its own; both are ways the drain could have broken something it did not name.
+# ---------------------------------------------------------------------------
+describe "bq-317 x note_fail: a transient failure still rolls back for an in-window retry"
+H="$WORK/home-rollback"
+CAP="$H/.cache/prefix-proxy"
+SID=abababab-1111-2222-3333-444444444444
+make_capture "$CAP" "req-fail-000-msg" "$SID" 50
+STAGE="$WORK/stage-rollback"
+mkdir -p "$STAGE"
+cp "$REPO_DIR/replay-warmer.sh" "$STAGE/"
+# A 401-style transient failure: nonzero exit, but NOT the exit-3 permanent refusal.
+cat > "$STAGE/warm-replay.py" <<'PYSTUB'
+import json, sys
+print(json.dumps({"http": 401, "error": "token expired"}))
+sys.exit(1)
+PYSTUB
+mkdir -p "$H/.cache/cache-warmer-v3"
+printf '111' > "$H/.cache/cache-warmer-v3/$SID.last_attempt"
+HOME="$H" CW_CONFIG="$WORK/config-clock" bash "$STAGE/replay-warmer.sh"
+assert_eq "last_attempt rolled back to the pre-attempt value" "111" \
+  "$(cat "$H/.cache/cache-warmer-v3/$SID.last_attempt")"
+assert_eq "the failure streak was counted" "1" \
+  "$(cat "$H/.cache/cache-warmer-v3/$SID.fail_count")"
+assert_eq "and it was logged as a retry, not a giveup" "yes" \
+  "$(grep -q 'RETRY sid=' "$H/.claude/logs/cache-warmer.log" && echo yes || echo no)"
+# Third consecutive failure stops rolling back — the rate-limit cooldown holds.
+HOME="$H" CW_CONFIG="$WORK/config-clock" bash "$STAGE/replay-warmer.sh"
+HOME="$H" CW_CONFIG="$WORK/config-clock" bash "$STAGE/replay-warmer.sh"
+assert_eq "after 3 failures it gives up rather than retrying forever" "yes" \
+  "$(grep -q 'GIVEUP sid=' "$H/.claude/logs/cache-warmer.log" && echo yes || echo no)"
+
+describe "bq-319 predicate: a malformed capture fails CLOSED, it does not crash the run"
+H="$WORK/home-malformed"
+CAP="$H/.cache/prefix-proxy"
+MAL=bcbcbcbc-1111-2222-3333-444444444444
+mkdir -p "$CAP"
+# .messages is an object, not an array — jq errors, and `set -e` is live.
+jq -nc --arg sp "/tmp/claude-1000/proj/$MAL/scratchpad" \
+  '{model:"m",max_tokens:32000,system:[{type:"text",text:("Scratchpad Directory\n"+$sp)}],messages:{role:"user"}}' \
+  > "$CAP/req-malformed-000-msg.json"
+jq -nc '{url:"/v1/messages",headers:{}}' > "$CAP/req-malformed-000-msg.hdrs.json"
+touch -d '50 minutes ago' "$CAP/req-malformed-000-msg.json" "$CAP/req-malformed-000-msg.hdrs.json"
+make_capture "$CAP" "req-good-001-msg" bdbdbdbd-1111-2222-3333-444444444444 50
+STAGE="$WORK/stage-malformed"
+mkdir -p "$STAGE"
+cp "$REPO_DIR/replay-warmer.sh" "$STAGE/"
+stub_warm_replay "$STAGE" '{"http":200,"cache_read":71410,"cache_creation":0,"output_tokens":1}'
+assert_status "the run completes rather than dying under set -e" 0 \
+  env HOME="$H" CW_CONFIG="$WORK/config-clock" bash "$STAGE/replay-warmer.sh"
+assert_eq "the malformed capture was skipped" "no" \
+  "$(grep -q 'req-malformed-000-msg' "$STAGE/calls.log" 2>/dev/null && echo yes || echo no)"
+assert_eq "the healthy capture beside it was still warmed" "yes" \
+  "$(grep -q 'req-good-001-msg' "$STAGE/calls.log" && echo yes || echo no)"
+
+# ---------------------------------------------------------------------------
 printf '\n----------------------------------------\n'
 printf 'v3: Passed: %d   Failed: %d\n' "$PASS" "$FAIL"
 ((FAIL == 0))
