@@ -1,12 +1,18 @@
 # claude-code-cache-warmer
 
-> **⚠ v2 (fork-based, this README) is BROKEN on Claude Code ≥ 2.1.198** — the
-> system prompt now embeds a session-specific scratchpad path, so a fork's
+> **⚠ v2 (fork-based — most of this README) is BROKEN on Claude Code ≥ 2.1.198**
+> — the system prompt now embeds a session-specific scratchpad path, so a fork's
 > prefix can never match its parent's and every warm pays a full cache write
-> for zero hits. **Use v3 (replay-based) instead**: `prefix-proxy.js` +
-> `replay-warmer.sh` + `warm-replay.py`, which replays each session's own
-> captured request byte-for-byte (verified: `cache_read=71383,
+> for zero hits. **v3 (replay-based) is the engine `./install.sh` installs**:
+> `prefix-proxy.js` + `replay-warmer.sh` + `warm-replay.py`, which replays each
+> session's own captured request byte-for-byte (verified: `cache_read=71383,
 > cache_creation=0`). Diagnosis + v3 architecture: [docs/V3-DIAGNOSIS.md](docs/V3-DIAGNOSIS.md).
+> On an affected version the installer **refuses** `--engine v2` unless you also
+> pass `--force-v2`.
+>
+> The gating tables and "How it decides what to warm" section below still
+> describe **v2's** knobs. v3 shares the config file but gates on captures, not
+> transcripts — see [v3 install](#install-v3-replay-engine-default).
 >
 > **Status: experimental.** v2 was built and verified on Claude Code v2.1.173 /
 > GNU Linux, 2026-06-11; v3 on v2.1.198, 2026-07-02. Both couple to Claude
@@ -85,20 +91,55 @@ All tested empirically before settling on the fork design:
   Without the 1h TTL the default is ~5 minutes and pre-expiry warming is not
   practical (a fork takes 10s–3min to spawn).
 
-## Install
+## Install (v3 replay engine, default)
+
+Requires `node` (≥ 18), `python3`, `jq`, and `claude` on PATH.
 
 ```bash
 git clone https://github.com/AshitaOrbis/claude-code-cache-warmer
 cd claude-code-cache-warmer
-./install.sh        # installs a 10-min systemd timer — INERT until you enable it
+./install.sh        # v3: prefix-proxy.service + a 10-min timer — INERT until enabled
 ```
+
+That installs **two** systemd user units, both pointed at one shared capture
+directory (`CW_CAPTURE_DIR`, default `~/.cache/prefix-proxy`):
+
+| Unit | What it does |
+|---|---|
+| `prefix-proxy.service` | `node prefix-proxy.js` on `127.0.0.1:8377`, forwarding to api.anthropic.com and capturing each `/v1/messages` request prefix. Supervised (`Restart=always`). Prunes its own captures on a timer — retention does **not** depend on the warmer running. |
+| `cache-warmer.timer` → `.service` | runs `replay-warmer.sh` every 10 min |
 
 The tool ships **disabled** (`ENABLED=0` in `config`). Before enabling:
 
 ```bash
-python3 measure-ttl.py        # verify your cache TTL from existing history (free)
-./cache-warmer.sh --dry-run   # preview exactly what it would warm right now
-$EDITOR config                # set ENABLED=1
+curl -fs http://127.0.0.1:8377/warmer-health   # the proxy answers with its nonce
+export ANTHROPIC_BASE_URL=http://127.0.0.1:8377  # route sessions through it (see below)
+./replay-warmer.sh --dry-run                   # preview exactly what it would warm
+$EDITOR config                                 # set ENABLED=1
+```
+
+Only sessions launched **through the proxy** are warmable — v3 replays a real
+captured request, so a session that never went through it has nothing to
+replay. Guard the export so a proxy that is down fails open:
+
+```bash
+# ~/.bashrc
+if [ "$(curl -fs --max-time 1 http://127.0.0.1:8377/warmer-health 2>/dev/null)" \
+     = "$(cat ~/.cache/prefix-proxy/.health-nonce 2>/dev/null)" ]; then
+  export ANTHROPIC_BASE_URL=http://127.0.0.1:8377
+fi
+```
+
+### Install (v2 fork engine — legacy)
+
+**Unsupported on Claude Code ≥ 2.1.198**, where it warms nothing and bills a
+full cache write per attempt. The installer refuses it there:
+
+```bash
+./install.sh --engine v2                # refused on an affected version
+./install.sh --engine v2 --force-v2     # override, not advised
+python3 measure-ttl.py                  # verify your cache TTL from existing history (free)
+./cache-warmer.sh --dry-run             # preview exactly what it would warm right now
 ```
 
 `measure-ttl.py` buckets cache-hit ratios against idle gaps across your recent

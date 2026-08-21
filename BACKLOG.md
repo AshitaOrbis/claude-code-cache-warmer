@@ -49,8 +49,17 @@ Deferred improvements from the 2026-06-11 GPT-5.5 Pro review
 
 ## v3 (replay) follow-ups — added 2026-07-02
 
-- [ ] install.sh: install prefix-proxy.service + repoint cache-warmer.service
-      to replay-warmer.sh (currently manual)
+- [x] install.sh: install prefix-proxy.service + repoint cache-warmer.service
+      to replay-warmer.sh (currently manual) — v3 is now the DEFAULT engine;
+      v2 needs `--engine v2` and is refused on Claude Code >= 2.1.198 without
+      `--force-v2`. Rendering + version gating live in `lib/units.sh` so they
+      are testable.
+- [ ] **Execute the v3 installer once on a clean box.** The unit CONTENT is
+      unit-tested; `./install.sh` itself has never been run end-to-end since
+      the rewrite (it writes systemd units, so no test suite may run it). Until
+      someone does, treat the v3 install path as untested-in-anger: verify the
+      two units come up, the proxy answers `/warmer-health`, and a real session
+      routed through it produces a capture.
 - [x] Tests/CI for replay-warmer.sh gating + warm-replay.py (v2 test suite
       covers the fork engine only) — `tests/run-v3.sh`, hermetic (temp HOME,
       temp capture store, local fake SSE server, stub replay); wired into CI

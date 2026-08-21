@@ -32,7 +32,7 @@ jobs:
           sudo apt-get install -y -qq shellcheck
           shellcheck --version
           shellcheck -x --severity=warning \
-            cache-warmer.sh install.sh lib/classify.sh tests/run.sh \
+            cache-warmer.sh install.sh lib/classify.sh lib/units.sh tests/run.sh \
             replay-warmer.sh tests/run-v3.sh tests/live-replay-gate.sh
 
       # shfmt format check on the files this repo formats with shfmt (lib/ +

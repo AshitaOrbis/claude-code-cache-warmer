@@ -277,6 +277,65 @@ assert_eq "no failure streak recorded" "no" \
   "$([[ -f $H/.cache/cache-warmer-v3/$SID.fail_count ]] && echo yes || echo no)"
 
 # ---------------------------------------------------------------------------
+# bq-313 — the published install path must not ship the known-broken v2 engine.
+# install.sh itself is NEVER executed here (it writes systemd units); the
+# decisions it makes were extracted into lib/units.sh precisely so they could be
+# tested without installing anything.
+# ---------------------------------------------------------------------------
+# shellcheck source=../lib/units.sh
+source "$REPO_DIR/lib/units.sh"
+
+describe "bq-313 version gate: v2 is refused from the release that broke forking"
+assert_eq "v2_broken_from is the diagnosed release" "2.1.198" "$V2_BROKEN_FROM"
+assert_status "2.1.173 (v2 verified working) is supported" 0 v2_supported 2.1.173
+assert_status "2.1.198 (the breaking release itself) is NOT" 1 v2_supported 2.1.198
+assert_status "2.1.238 (current) is NOT" 1 v2_supported 2.1.238
+assert_status "an unreadable version fails CLOSED, not open" 1 v2_supported ""
+assert_status "2.2.0 sorts above 2.1.198 (component-wise, not lexical)" 1 v2_supported 2.2.0
+assert_status "2.1.99 sorts BELOW 2.1.198 (the lexical trap)" 0 v2_supported 2.1.99
+assert_status "version_ge is reflexive" 0 version_ge 2.1.198 2.1.198
+assert_status "a short version pads with zeros: 2.1 < 2.1.198" 1 version_ge 2.1 2.1.198
+
+describe "bq-313 units: the v3 install supervises the proxy AND shares one capture dir"
+proxy_unit=$(render_proxy_unit /usr/bin/node /opt/cw/prefix-proxy.js 8377 /home/u/.cache/prefix-proxy 6)
+assert_eq "ExecStart runs the node proxy with port and capture dir" "yes" \
+  "$(grep -qF 'ExecStart=/usr/bin/node "/opt/cw/prefix-proxy.js" 8377 "/home/u/.cache/prefix-proxy"' \
+      <<<"$proxy_unit" && echo yes || echo no)"
+assert_eq "proxy is supervised, not oneshot" "yes" \
+  "$(grep -q '^Restart=always' <<<"$proxy_unit" && echo yes || echo no)"
+assert_eq "retention window reaches the proxy" "yes" \
+  "$(grep -q '^Environment=CW_PRUNE_HOURS=6' <<<"$proxy_unit" && echo yes || echo no)"
+
+warmer_v3=$(render_warmer_service /bin/bash /opt/cw/replay-warmer.sh /usr/bin v3)
+assert_eq "v3 warmer unit runs replay-warmer.sh" "yes" \
+  "$(grep -qF 'ExecStart=/bin/bash "/opt/cw/replay-warmer.sh"' <<<"$warmer_v3" && echo yes || echo no)"
+assert_eq "v3 warmer unit does NOT run the fork engine" "no" \
+  "$(grep -qE '(^|[^-])cache-warmer\.sh' <<<"$warmer_v3" && echo yes || echo no)"
+warmer_v2=$(render_warmer_service /bin/bash /opt/cw/cache-warmer.sh /usr/bin v2)
+assert_eq "v2 warmer unit still runs the fork engine when asked for" "yes" \
+  "$(grep -qF 'ExecStart=/bin/bash "/opt/cw/cache-warmer.sh"' <<<"$warmer_v2" && echo yes || echo no)"
+
+describe "bq-313 units: exotic repo paths survive systemd's ExecStart quoting"
+assert_eq "backslash and double-quote are escaped" '/a\\b\"c/warm.sh' \
+  "$(systemd_quote '/a\b"c/warm.sh')"
+assert_eq "a path with spaces stays one argument" "yes" \
+  "$(render_warmer_service /bin/bash '/opt/my repo/replay-warmer.sh' /usr/bin v3 \
+     | grep -qF 'ExecStart=/bin/bash "/opt/my repo/replay-warmer.sh"' && echo yes || echo no)"
+
+describe "bq-313 install.sh: default engine is v3 and v2 is gated (static, never executed)"
+assert_eq "default engine is v3" "yes" \
+  "$(grep -q '^ENGINE=v3$' "$REPO_DIR/install.sh" && echo yes || echo no)"
+assert_eq "installs the proxy unit" "yes" \
+  "$(grep -q 'render_proxy_unit' "$REPO_DIR/install.sh" && echo yes || echo no)"
+assert_eq "declares node as a v3 dependency" "yes" \
+  "$(grep -q 'deps+=(node)' "$REPO_DIR/install.sh" && echo yes || echo no)"
+assert_eq "v2 on an affected version needs an explicit override" "yes" \
+  "$(grep -q 'v2_supported .* && ((FORCE_V2 == 0))' "$REPO_DIR/install.sh" && echo yes || echo no)"
+assert_eq "uninstall removes the proxy unit too" "yes" \
+  "$(sed -n '/--uninstall)/,/exit 0/p' "$REPO_DIR/install.sh" \
+     | grep -q 'prefix-proxy.service' && echo yes || echo no)"
+
+# ---------------------------------------------------------------------------
 printf '\n----------------------------------------\n'
 printf 'v3: Passed: %d   Failed: %d\n' "$PASS" "$FAIL"
 ((FAIL == 0))
