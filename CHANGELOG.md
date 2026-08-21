@@ -1,5 +1,61 @@
 # Changelog
 
+## Unreleased — v3 hardening (GPT-5.6-Pro review, 2026-08-12)
+
+Eight findings against the v3 replay engine. The engine had **no tests at all**
+before this pass — `tests/run.sh` covers the v2 fork engine only — which is why
+every one of these landed unguarded. `tests/run-v3.sh` (104 assertions,
+hermetic: temp HOME, temp capture store, a local fake api.anthropic.com, a stub
+replay; no network, no credentials, and it never runs `install.sh`) now runs in
+CI alongside shellcheck for `replay-warmer.sh` and `lib/units.sh`.
+
+- **The published install path shipped the broken engine.** The README said v2
+  was dead on Claude Code ≥ 2.1.198 and to use v3; the only install command was
+  `./install.sh`, which hard-coded `cache-warmer.sh`. `install.sh` now installs
+  the v3 stack by default — `prefix-proxy.service` (supervised) plus the timer
+  pointed at `replay-warmer.sh`, with `node` in the dependency check and one
+  shared capture directory named in both units — and refuses `--engine v2` on an
+  affected version without `--force-v2`. Unit rendering and version gating moved
+  to `lib/units.sh` so they are testable without installing anything.
+- **Capture retention no longer depends on the warmer.** Full conversation
+  bodies were pruned only after `replay-warmer.sh`'s `ENABLED != 1` early exit,
+  and only for `req-*` — so the shipped default (`ENABLED=0`) and any proxy
+  crash left prompts on disk indefinitely. `prefix-proxy.js` now prunes both
+  `req-*` and `pending-*` in its own store at startup and every 10 min, and
+  re-asserts mode 0700 on a directory that already exists.
+- **Replay warms are output-capped.** A replay resent the capture's own
+  `max_tokens`, thinking budget and task, then consumed the entire regenerated
+  answer. `warm-replay.py` now caps `max_tokens` with a byte-surgical edit that
+  leaves every cache-key-bearing byte untouched (ambiguous bodies are refused,
+  not guessed), and aborts the stream at `message_start` when the cap alone
+  cannot bound generation. Uncappable and unabortable ⇒ refused. The unmeasured
+  "~30–40 output tokens" cost claim is **withdrawn** pending
+  `tests/live-replay-gate.sh`.
+- **A malformed `EXCLUDE_SIDS` fails closed.** Bash returns status 2 for a
+  regex that does not compile and 1 for one that does not match; inside an `if`
+  both read as false, so a typo silently excluded nothing and the warmer
+  replayed sessions the operator had ruled out. Both regex knobs are now
+  compile-checked at startup, before pruning or replaying.
+- **Time gates are re-read per candidate.** A run-wide `now` aged every session
+  as of run start while an earlier candidate could hold the loop for jitter plus
+  a 180 s socket timeout. The clock is re-read per candidate and again after the
+  jitter, the dispatch is aborted if the window closed, and `last_attempt`
+  records the actual dispatch time. Jitter is now a knob (`MAX_JITTER`).
+- **The proxy and warmer can no longer both claim success while capturing
+  nothing.** One shared capture-directory setting; the proxy proves the store is
+  writable at startup and exits if not; write failures are logged instead of
+  swallowed; `/warmer-health` 503s on capture failure and
+  `/warmer-health/json` reports capture state; the warmer exits nonzero when its
+  store is unreadable or when recent captures exist but none are usable.
+- **`MIN_MSGS` counts human turns.** It counted the raw API message array, so a
+  headless `claude -p` job that made two tool calls cleared the gate that is
+  documented as filtering exactly those. It now mirrors `lib/jsonl.py`'s
+  real-user predicate.
+- **Strict argument parsing.** `--dryrun`, `--dry-run=true` or any other typo
+  ran a LIVE warm; even the correct flag pruned captures before printing
+  anything. Unknown arguments now exit 2 before any side effect, and a valid
+  `--dry-run` mutates nothing.
+
 ## v0.4.1 — 2026-07-02
 
 - **Fix: a transient replay failure no longer permanently breaks a session's
