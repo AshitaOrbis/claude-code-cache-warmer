@@ -48,6 +48,11 @@ assert_status() {
 WORK=$(mktemp -d)
 trap 'rm -rf "$WORK"' EXIT
 
+# Pin the inter-warm jitter to zero everywhere except the bq-317 block, which
+# sets it deliberately. Without this the suite would sleep up to 44 s per
+# dispatched warm and its timing assertions would be non-deterministic.
+export CW_JITTER_SECONDS=0
+
 # ---------------------------------------------------------------------------
 # Fixture builders
 # ---------------------------------------------------------------------------
@@ -74,6 +79,16 @@ make_capture() {
   jq -nc '{url: "/v1/messages?beta=true", headers: {"anthropic-version": "2023-06-01"}}' \
     > "$dir/$stem.hdrs.json"
   touch -d "$age minutes ago" "$dir/$stem.json" "$dir/$stem.hdrs.json"
+}
+
+# age_capture <capture-dir> <stem> <seconds-ago>
+# Back-date a capture pair with second precision — the warm-window gates are
+# minute-quantised, so crossing one on purpose needs finer control than
+# make_capture's minutes.
+age_capture() {
+  local dir=$1 stem=$2 secs=$3 when
+  when=$(( $(date +%s) - secs ))
+  touch -d "@$when" "$dir/$stem.json" "$dir/$stem.hdrs.json"
 }
 
 # stub_warm_replay <bindir> <result-json>
@@ -426,6 +441,51 @@ assert_eq "a well-formed exclude keeps the session off the wire" "no" \
 HOME="$H" CW_CONFIG="$WORK/config-regex" bash "$STAGE/replay-warmer.sh"
 assert_eq "with no exclude, the same session IS warmed (positive control)" "yes" \
   "$([[ -f $STAGE/calls.log ]] && echo yes || echo no)"
+
+# ---------------------------------------------------------------------------
+# bq-317 — one run-wide `now` aged every candidate as of run START, while a
+# single earlier candidate can hold the loop for jitter + a replay that may
+# block on a 180 s socket timeout.
+# ---------------------------------------------------------------------------
+describe "bq-317 clock: a window that closes during the jitter aborts the dispatch"
+H="$WORK/home-clock"
+CAP="$H/.cache/prefix-proxy"
+SID=cccccccc-1111-2222-3333-444444444444
+make_capture "$CAP" "req-edge-000-msg" "$SID" 50
+# 3 s inside the far edge of the 45-58 min window: passes the gate, and is
+# outside it again by the time a 6 s jitter has elapsed.
+age_capture "$CAP" "req-edge-000-msg" $(( 58 * 60 - 3 ))
+STAGE="$WORK/stage-clock"
+mkdir -p "$STAGE"
+cp "$REPO_DIR/replay-warmer.sh" "$STAGE/"
+stub_warm_replay "$STAGE" '{"http":200,"cache_read":71410,"cache_creation":0,"output_tokens":1}'
+printf 'ENABLED=1\n' > "$WORK/config-clock"
+HOME="$H" CW_CONFIG="$WORK/config-clock" CW_JITTER_SECONDS=6 bash "$STAGE/replay-warmer.sh"
+assert_eq "no replay dispatched after the window closed" "no" \
+  "$([[ -f $STAGE/calls.log ]] && echo yes || echo no)"
+assert_eq "and it said so" "yes" \
+  "$(grep -q 'warm window closed during the run' "$H/.claude/logs/cache-warmer.log" && echo yes || echo no)"
+assert_eq "no last_attempt recorded for a warm that never left" "no" \
+  "$([[ -f $H/.cache/cache-warmer-v3/$SID.last_attempt ]] && echo yes || echo no)"
+
+describe "bq-317 clock: last_attempt is the DISPATCH time, not the run-start time"
+H="$WORK/home-stamp"
+CAP="$H/.cache/prefix-proxy"
+SID=dddddddd-1111-2222-3333-444444444444
+make_capture "$CAP" "req-mid-000-msg" "$SID" 50
+STAGE="$WORK/stage-stamp"
+mkdir -p "$STAGE"
+cp "$REPO_DIR/replay-warmer.sh" "$STAGE/"
+stub_warm_replay "$STAGE" '{"http":200,"cache_read":71410,"cache_creation":0,"output_tokens":1}'
+started=$(date +%s)
+HOME="$H" CW_CONFIG="$WORK/config-clock" CW_JITTER_SECONDS=4 bash "$STAGE/replay-warmer.sh"
+recorded=$(cat "$H/.cache/cache-warmer-v3/$SID.last_attempt")
+assert_eq "replay dispatched (positive control)" "yes" \
+  "$([[ -f $STAGE/calls.log ]] && echo yes || echo no)"
+assert_eq "stamp is at least the jitter later than run start" "yes" \
+  "$([[ $((recorded - started)) -ge 3 ]] && echo yes || echo no)"
+assert_eq "the WARM line records the jitter it actually slept" "yes" \
+  "$(grep -q 'jitter=4s' "$H/.claude/logs/cache-warmer.log" && echo yes || echo no)"
 
 # ---------------------------------------------------------------------------
 printf '\n----------------------------------------\n'

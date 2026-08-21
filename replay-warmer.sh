@@ -85,12 +85,13 @@ EXCLUDE_SIDS=''
 INCLUDE_ONLY_SIDS=''
 MAX_CAPTURE_AGE_MIN=240
 MIN_MSGS=3
+MAX_JITTER=45  # seconds; 0..MAX_JITTER of jitter between warms in one run
 PRUNE_HOURS=6   # captures are only warm-eligible for MAX_CAPTURE_AGE_MIN; don't retain bodies longer
 # shellcheck disable=SC1090
 [[ -f $CONFIG_FILE ]] && source "$CONFIG_FILE"
 # Env overrides (testing): CW_<KNOB>
 for _n in ENABLED WARM_MIN_AGE WARM_MAX_AGE RATELIMIT_MIN MISMATCH_COOLDOWN_DAYS \
-          MAX_CAPTURE_AGE_MIN MIN_MSGS PRUNE_HOURS; do
+          MAX_CAPTURE_AGE_MIN MIN_MSGS PRUNE_HOURS MAX_JITTER; do
   _o="CW_$_n"
   [[ -n ${!_o:-} ]] && declare "$_n=${!_o}"
   [[ ${!_n} =~ ^[0-9]+$ ]] || { echo "config error: $_n must be an integer (got '${!_n}')" >&2; exit 2; }
@@ -171,6 +172,13 @@ done < <(find "$CAP_DIR" -maxdepth 1 -name 'req-*-msg.json' 2>/dev/null)
 for sid in "${!NEWEST_FILE[@]}"; do
   f=${NEWEST_FILE[$sid]}; cap_mtime=${NEWEST_MTIME[$sid]}
 
+  # Re-read the clock for EVERY candidate (bq-317). One run-wide `now` aged
+  # every session as of run start, but a single earlier candidate can hold the
+  # loop for up to MAX_JITTER seconds of jitter plus a replay that may block on
+  # warm-replay.py's 180 s socket timeout — so by the time a later candidate is
+  # evaluated, the timestamp it is judged against can be minutes stale.
+  now=$(date +%s)
+
   if [[ -n $INCLUDE_ONLY_SIDS && ! $sid =~ $INCLUDE_ONLY_SIDS ]]; then continue; fi
   if [[ -n $EXCLUDE_SIDS && $sid =~ $EXCLUDE_SIDS ]]; then continue; fi
 
@@ -216,9 +224,25 @@ for sid in "${!NEWEST_FILE[@]}"; do
     continue
   fi
 
+  # Jitter FIRST, then re-check the window and stamp last_attempt with the
+  # actual dispatch time (bq-317). The old order slept up to 45 s after passing
+  # the gate and then dispatched unconditionally, so a warm could leave at an
+  # age the gate would have rejected — and recorded the run-start timestamp as
+  # its attempt time, which makes the RATELIMIT_MIN spacing wrong in the
+  # permissive direction by however long the run took.
+  jitter=${CW_JITTER_SECONDS:-$(( RANDOM % (MAX_JITTER + 1) ))}
+  [[ $jitter =~ ^[0-9]+$ ]] || jitter=0
+  sleep "$jitter"   # so multi-session warms don't fire as a burst
+
+  now=$(date +%s)
+  age_min=$(( (now - fresh) / 60 ))
+  if (( age_min < WARM_MIN_AGE || age_min >= WARM_MAX_AGE )); then
+    log "skip sid=${sid:0:8}: warm window closed during the run (age=${age_min}m, jitter=${jitter}s)"
+    continue
+  fi
+
   printf '%s' "$now" > "$STATE_DIR/${sid}.last_attempt"
-  sleep $(( RANDOM % 45 ))   # jitter so multi-session warms don't fire as a burst
-  log "WARM sid=${sid:0:8} age=${age_min}m cap-age=${cap_age_min}m msgs=$msgs (replay $(basename "$f"))"
+  log "WARM sid=${sid:0:8} age=${age_min}m cap-age=${cap_age_min}m msgs=$msgs jitter=${jitter}s (replay $(basename "$f"))"
   rc=0
   result=$(python3 "$SCRIPT_DIR/warm-replay.py" "$f" "${f%.json}.hdrs.json" 2>>"$LOG_FILE") || rc=$?
   if (( rc == 3 )); then

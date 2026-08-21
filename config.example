@@ -74,5 +74,12 @@ MAX_CAPTURE_AGE_MIN=240
 MIN_MSGS=3
 
 # Delete captures older than this (hours). Capture bodies hold conversation
-# content — keep the retention window short.
+# content — keep the retention window short. Enforced by BOTH prefix-proxy.js
+# (on its own timer, so it survives ENABLED=0 and a warmer that never runs) and
+# replay-warmer.sh.
 PRUNE_HOURS=6
+
+# Seconds of jitter between warms within one run, so multi-session warms don't
+# fire as a burst. The warm window is re-checked AFTER the jitter, so a large
+# value costs skipped warms rather than warms sent outside the window.
+MAX_JITTER=45
