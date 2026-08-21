@@ -192,8 +192,21 @@ for sid in "${!NEWEST_FILE[@]}"; do
   cap_age_min=$(( (now - cap_mtime) / 60 ))
   if (( cap_age_min > MAX_CAPTURE_AGE_MIN )); then continue; fi
 
-  # One-shot `claude -p` captures have a single message — not worth warming.
-  msgs=$(jq -r '.messages | length' "$f" 2>/dev/null) || msgs=0
+  # Count HUMAN turns, not API messages (bq-319). `.messages | length` counted
+  # the whole array — assistant tool_use turns and the user-role tool_result
+  # turns that answer them included — so a one-shot `claude -p` job that made
+  # two tool calls presented as five messages and sailed straight through the
+  # gate that docs/V3-DIAGNOSIS.md claims filters exactly those captures. The
+  # predicate mirrors lib/jsonl.py's `_is_real_user_text`: role user, and
+  # content that is either plain text or a block list carrying no tool_result.
+  msgs=$(jq -r '
+      [ (.messages // [])[]
+        | select(.role == "user")
+        | select((.content | type) == "string"
+                 or ([ (.content // [])[]
+                       | select(type == "object" and .type == "tool_result") ] | length) == 0)
+      ] | length' "$f" 2>/dev/null) || msgs=0
+  [[ $msgs =~ ^[0-9]+$ ]] || msgs=0
   if (( msgs < MIN_MSGS )); then continue; fi
 
   # SERVER-executed tools (web_search, web_fetch, code_execution, hosted MCP)

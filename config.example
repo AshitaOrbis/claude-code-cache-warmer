@@ -70,7 +70,11 @@ FORK_RETENTION_DAYS=7
 # (minutes). The capture is the replay source; past ~4 h the session is done.
 MAX_CAPTURE_AGE_MIN=240
 
-# Skip captures with fewer messages than this (filters one-shot `claude -p`).
+# Minimum HUMAN turns a capture must carry before it qualifies (filters
+# one-shot `claude -p` jobs). Counts user messages whose content is text —
+# assistant tool_use turns and the user-role tool_result turns that answer
+# them do NOT count, so a headless job that made a few tool calls cannot
+# pass by message volume alone. Same semantics as v2's MIN_USER_MSGS.
 MIN_MSGS=3
 
 # Delete captures older than this (hours). Capture bodies hold conversation

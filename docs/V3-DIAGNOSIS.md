@@ -49,7 +49,9 @@ Don't reconstruct the prefix — **replay the session's own last request**:
    byte-for-byte with a fresh OAuth token (`warm-replay.py`). The exact-prefix
    read (0.1×) refreshes the 1h TTL. Same gating as v2: warm window 45–58 min,
    240 min max capture age, 30 min rate limit, 2-strike blacklist, MIN_MSGS=3
-   filters one-shot `claude -p` captures.
+   filters one-shot `claude -p` captures — counting HUMAN turns, not API
+   messages, since a headless job that makes a couple of tool calls otherwise
+   clears a raw message-count gate on tool traffic alone (bq-319).
 
 ### Why replay had to be byte- and header-exact (measured)
 

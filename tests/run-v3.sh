@@ -59,7 +59,9 @@ export CW_JITTER_SECONDS=0
 
 # make_capture <capture-dir> <stem> <sid> <age-minutes> [body-json]
 # Writes the promoted body+headers pair the warmer expects, back-dated so the
-# age gates can be exercised without waiting.
+# age gates can be exercised without waiting. The default body carries THREE
+# human turns, so it clears the default MIN_MSGS=3 — which counts human turns,
+# not API messages (bq-319).
 make_capture() {
   local dir=$1 stem=$2 sid=$3 age=$4 body=${5:-}
   mkdir -p "$dir"
@@ -70,7 +72,9 @@ make_capture() {
       system: [{type: "text", text: ("Scratchpad Directory\n" + $sp)}],
       messages: [
         {role: "user",      content: "one"},
-        {role: "assistant", content: "two"},
+        {role: "assistant", content: "a"},
+        {role: "user",      content: "two"},
+        {role: "assistant", content: "b"},
         {role: "user",      content: "three"}
       ]
     }')
@@ -486,6 +490,84 @@ assert_eq "stamp is at least the jitter later than run start" "yes" \
   "$([[ $((recorded - started)) -ge 3 ]] && echo yes || echo no)"
 assert_eq "the WARM line records the jitter it actually slept" "yes" \
   "$(grep -q 'jitter=4s' "$H/.claude/logs/cache-warmer.log" && echo yes || echo no)"
+
+# ---------------------------------------------------------------------------
+# bq-319 — MIN_MSGS is documented as the filter that keeps one-shot `claude -p`
+# jobs out of the warm rotation, but it counted the raw API message array, so
+# any headless job that used a couple of tools cleared it.
+# ---------------------------------------------------------------------------
+# body_with_msgs <sid> <messages-json>
+body_with_msgs() {
+  jq -nc --arg sp "/tmp/claude-1000/proj/$1/scratchpad" --argjson m "$2" '{
+    model: "claude-opus-5", max_tokens: 32000,
+    system: [{type: "text", text: ("Scratchpad Directory\n" + $sp)}],
+    messages: $m
+  }'
+}
+
+ONESHOT_MSGS='[
+  {"role":"user","content":"run the nightly job"},
+  {"role":"assistant","content":[{"type":"tool_use","id":"1","name":"bash","input":{}}]},
+  {"role":"user","content":[{"type":"tool_result","tool_use_id":"1","content":"ok"}]},
+  {"role":"assistant","content":[{"type":"tool_use","id":"2","name":"bash","input":{}}]},
+  {"role":"user","content":[{"type":"tool_result","tool_use_id":"2","content":"ok"}]}
+]'
+INTERACTIVE_MSGS='[
+  {"role":"user","content":"one"},
+  {"role":"assistant","content":"a"},
+  {"role":"user","content":[{"type":"text","text":"two"}]},
+  {"role":"assistant","content":"b"},
+  {"role":"user","content":"three"}
+]'
+
+describe "bq-319 return-intent gate: a headless one-shot with tool traffic is REFUSED"
+H="$WORK/home-minmsgs"
+CAP="$H/.cache/prefix-proxy"
+ONE=eeeeeeee-1111-2222-3333-444444444444
+make_capture "$CAP" "req-oneshot-000-msg" "$ONE" 50 "$(body_with_msgs "$ONE" "$ONESHOT_MSGS")"
+STAGE="$WORK/stage-minmsgs"
+mkdir -p "$STAGE"
+cp "$REPO_DIR/replay-warmer.sh" "$STAGE/"
+stub_warm_replay "$STAGE" '{"http":200,"cache_read":71410,"cache_creation":0,"output_tokens":1}'
+printf 'ENABLED=1\n' > "$WORK/config-minmsgs"
+assert_eq "the capture really does have 5 API messages (the old count)" "5" \
+  "$(jq '.messages | length' "$CAP/req-oneshot-000-msg.json")"
+HOME="$H" CW_CONFIG="$WORK/config-minmsgs" bash "$STAGE/replay-warmer.sh"
+assert_eq "one human turn behind five messages does not clear MIN_MSGS=3" "no" \
+  "$([[ -f $STAGE/calls.log ]] && echo yes || echo no)"
+
+describe "bq-319 return-intent gate: a genuine three-turn session still warms"
+INT=ffffffff-1111-2222-3333-444444444444
+make_capture "$CAP" "req-interactive-001-msg" "$INT" 50 "$(body_with_msgs "$INT" "$INTERACTIVE_MSGS")"
+HOME="$H" CW_CONFIG="$WORK/config-minmsgs" bash "$STAGE/replay-warmer.sh"
+assert_eq "three human turns clear the gate (positive control)" "yes" \
+  "$([[ -f $STAGE/calls.log ]] && echo yes || echo no)"
+assert_eq "and it was the interactive session that was replayed" "yes" \
+  "$(grep -q 'req-interactive-001-msg' "$STAGE/calls.log" && echo yes || echo no)"
+assert_eq "the one-shot was never replayed" "no" \
+  "$(grep -q 'req-oneshot-000-msg' "$STAGE/calls.log" && echo yes || echo no)"
+
+describe "bq-319 return-intent gate: text blocks count, tool_result blocks do not"
+MIX=99999999-aaaa-bbbb-cccc-dddddddddddd
+MIXED_MSGS='[
+  {"role":"user","content":"one"},
+  {"role":"assistant","content":"a"},
+  {"role":"user","content":[{"type":"tool_result","tool_use_id":"1","content":"ok"}]},
+  {"role":"user","content":[{"type":"text","text":"two"}]}
+]'
+H2="$WORK/home-mixed"
+CAP2="$H2/.cache/prefix-proxy"
+make_capture "$CAP2" "req-mixed-000-msg" "$MIX" 50 "$(body_with_msgs "$MIX" "$MIXED_MSGS")"
+STAGE2="$WORK/stage-mixed"
+mkdir -p "$STAGE2"
+cp "$REPO_DIR/replay-warmer.sh" "$STAGE2/"
+stub_warm_replay "$STAGE2" '{"http":200,"cache_read":71410,"cache_creation":0,"output_tokens":1}'
+HOME="$H2" CW_CONFIG="$WORK/config-minmsgs" bash "$STAGE2/replay-warmer.sh"
+assert_eq "2 human turns fail MIN_MSGS=3" "no" \
+  "$([[ -f $STAGE2/calls.log ]] && echo yes || echo no)"
+HOME="$H2" CW_CONFIG="$WORK/config-minmsgs" CW_MIN_MSGS=2 bash "$STAGE2/replay-warmer.sh"
+assert_eq "the same capture passes at MIN_MSGS=2 (the tool_result is not the 3rd)" "yes" \
+  "$([[ -f $STAGE2/calls.log ]] && echo yes || echo no)"
 
 # ---------------------------------------------------------------------------
 printf '\n----------------------------------------\n'
