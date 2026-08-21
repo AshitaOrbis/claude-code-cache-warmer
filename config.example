@@ -66,6 +66,12 @@ FORK_RETENTION_DAYS=7
 
 # ---- v3 (replay-warmer.sh) knobs — ignored by the v2 fork engine ----
 
+# Where prefix-proxy.js writes captures and replay-warmer.sh reads them.
+# ONE setting for both halves — install.sh passes it to the proxy unit and
+# exports it to the warmer unit as CW_CAPTURE_DIR. If they ever disagree,
+# both report success and nothing is ever warmed.
+CAPTURE_DIR="$HOME/.cache/prefix-proxy"
+
 # Stop warming once a session's newest captured request is older than this
 # (minutes). The capture is the replay source; past ~4 h the session is done.
 MAX_CAPTURE_AGE_MIN=240

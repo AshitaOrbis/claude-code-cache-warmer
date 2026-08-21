@@ -36,7 +36,6 @@ SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 CONFIG_FILE=${CW_CONFIG:-"$SCRIPT_DIR/config"}
 LOG_FILE="$HOME/.claude/logs/cache-warmer.log"
 STATE_DIR="$HOME/.cache/cache-warmer-v3"
-CAP_DIR="$HOME/.cache/prefix-proxy"
 UUID_RE='[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}'
 
 usage() {
@@ -86,6 +85,11 @@ INCLUDE_ONLY_SIDS=''
 MAX_CAPTURE_AGE_MIN=240
 MIN_MSGS=3
 MAX_JITTER=45  # seconds; 0..MAX_JITTER of jitter between warms in one run
+# ONE capture-store setting, shared with prefix-proxy.js (bq-318). The two
+# halves used to default independently — the proxy to /tmp/prefix-proxy, this
+# script to ~/.cache/prefix-proxy — so both could report success while the
+# warmer scanned a directory nothing had ever written to.
+CAPTURE_DIR="$HOME/.cache/prefix-proxy"
 PRUNE_HOURS=6   # captures are only warm-eligible for MAX_CAPTURE_AGE_MIN; don't retain bodies longer
 # shellcheck disable=SC1090
 [[ -f $CONFIG_FILE ]] && source "$CONFIG_FILE"
@@ -97,6 +101,7 @@ for _n in ENABLED WARM_MIN_AGE WARM_MAX_AGE RATELIMIT_MIN MISMATCH_COOLDOWN_DAYS
   [[ ${!_n} =~ ^[0-9]+$ ]] || { echo "config error: $_n must be an integer (got '${!_n}')" >&2; exit 2; }
 done
 [[ -n ${CW_INCLUDE_ONLY_SIDS:-} ]] && INCLUDE_ONLY_SIDS=$CW_INCLUDE_ONLY_SIDS
+CAP_DIR=${CW_CAPTURE_DIR:-$CAPTURE_DIR}
 [[ -n ${CW_EXCLUDE_SIDS:-} ]] && EXCLUDE_SIDS=$CW_EXCLUDE_SIDS
 
 # Validate both session-id regexes at startup, exactly as the v2 engine does
@@ -154,20 +159,45 @@ prune_captures() {
 
 if (( ENABLED != 1 )); then exit 0; fi
 
+# An enabled warmer that cannot read its store is NOT a quiet no-op (bq-318):
+# it used to exit 0 having done nothing, so a store/proxy mismatch looked
+# exactly like "no sessions were due".
+if [[ ! -d $CAP_DIR || ! -r $CAP_DIR ]]; then
+  log "DEGRADED: capture store $CAP_DIR is missing or unreadable — is prefix-proxy.service writing somewhere else?"
+  echo "replay-warmer.sh: capture store $CAP_DIR is missing or unreadable" >&2
+  exit 1
+fi
+
 now=$(date +%s)
 declare -A NEWEST_FILE NEWEST_MTIME
 
-# Group captures by conversation sid (scratchpad path inside the body).
+# Group captures by conversation sid (scratchpad path inside the body), while
+# counting how many RECENT captures exist versus how many are actually usable —
+# a capture with no recoverable sid or no header sidecar cannot be replayed, and
+# silently skipping every one of them is indistinguishable from having nothing
+# to do (bq-318).
+recent_caps=0
+attributable=0
 while IFS= read -r f; do
   [[ $f == *.hdrs.json ]] && continue
+  m=$(stat -c %Y "$f" 2>/dev/null) || continue
+  recent=0
+  (( (now - m) / 60 <= MAX_CAPTURE_AGE_MIN )) && recent=1
+  (( recent )) && recent_caps=$((recent_caps + 1))
   sid=$(grep -aoE "[0-9a-f-]{36}/scratchpad" "$f" 2>/dev/null | head -1 | cut -d/ -f1) || sid=""
   [[ $sid =~ ^${UUID_RE}$ ]] || continue
   [[ -f ${f%.json}.hdrs.json ]] || continue
-  m=$(stat -c %Y "$f" 2>/dev/null) || continue
+  (( recent )) && attributable=$((attributable + 1))
   if [[ -z ${NEWEST_MTIME[$sid]:-} ]] || (( m > NEWEST_MTIME[$sid] )); then
     NEWEST_FILE[$sid]=$f; NEWEST_MTIME[$sid]=$m
   fi
 done < <(find "$CAP_DIR" -maxdepth 1 -name 'req-*-msg.json' 2>/dev/null)
+
+if (( recent_caps > 0 && attributable == 0 )); then
+  log "DEGRADED: $recent_caps recent capture(s) in $CAP_DIR but NONE readable+attributable (no session id recovered, or no .hdrs.json sidecar) — nothing can be warmed"
+  echo "replay-warmer.sh: $recent_caps recent capture(s) in $CAP_DIR, none usable" >&2
+  exit 1
+fi
 
 for sid in "${!NEWEST_FILE[@]}"; do
   f=${NEWEST_FILE[$sid]}; cap_mtime=${NEWEST_MTIME[$sid]}

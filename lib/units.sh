@@ -77,9 +77,11 @@ WantedBy=default.target
 UNIT
 }
 
-# render_warmer_service <bash-bin> <script> <unit-path> [engine]
+# render_warmer_service <bash-bin> <script> <unit-path> [engine] [capture-dir]
+# The capture dir is baked into the v3 unit so the warmer and the proxy can
+# never resolve different stores (bq-318).
 render_warmer_service() {
-  local bash_bin=$1 script=$2 unit_path=$3 engine=${4:-v3}
+  local bash_bin=$1 script=$2 unit_path=$3 engine=${4:-v3} capdir=${5:-}
   local desc="Claude Code prompt-cache warmer (v3 replay)"
   [[ $engine == v2 ]] && desc="Claude Code prompt-cache warmer (v2 fork-based keepalive)"
   cat <<UNIT
@@ -91,7 +93,8 @@ After=default.target
 Type=oneshot
 ExecStart=$bash_bin "$(systemd_quote "$script")"
 Environment=ENABLE_PROMPT_CACHING_1H=1
-Environment=PATH=$unit_path
+Environment=PATH=$unit_path${capdir:+
+Environment=CW_CAPTURE_DIR=$capdir}
 Nice=10
 IOSchedulingClass=best-effort
 IOSchedulingPriority=7

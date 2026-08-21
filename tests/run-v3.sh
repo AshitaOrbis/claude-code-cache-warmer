@@ -570,6 +570,84 @@ assert_eq "the same capture passes at MIN_MSGS=2 (the tool_result is not the 3rd
   "$([[ -f $STAGE2/calls.log ]] && echo yes || echo no)"
 
 # ---------------------------------------------------------------------------
+# bq-318 — both halves could report success while producing nothing usable:
+# they defaulted to DIFFERENT capture directories, the proxy swallowed every
+# write error, and the warmer exited 0 with zero candidates either way.
+# ---------------------------------------------------------------------------
+describe "bq-318 shared store: one resolution order for both components"
+assert_eq "proxy honours an explicit argv logdir first" "/explicit" \
+  "$(node -e 'console.log(require(process.argv[1]).resolveLogdir(["node","p.js","8377","/explicit"], {CW_CAPTURE_DIR:"/env"}))' "$REPO_DIR/prefix-proxy.js")"
+assert_eq "then CW_CAPTURE_DIR — the same knob the warmer reads" "/env" \
+  "$(node -e 'console.log(require(process.argv[1]).resolveLogdir(["node","p.js","8377"], {CW_CAPTURE_DIR:"/env"}))' "$REPO_DIR/prefix-proxy.js")"
+assert_eq "default is the warmer's directory, NOT /tmp/prefix-proxy" "$HOME/.cache/prefix-proxy" \
+  "$(node -e 'console.log(require(process.argv[1]).resolveLogdir(["node","p.js"], {}))' "$REPO_DIR/prefix-proxy.js")"
+assert_eq "the warmer reads CW_CAPTURE_DIR too" "yes" \
+  "$(grep -q 'CAP_DIR=${CW_CAPTURE_DIR:-\$CAPTURE_DIR}' "$REPO_DIR/replay-warmer.sh" && echo yes || echo no)"
+assert_eq "and install.sh bakes it into the warmer unit" "yes" \
+  "$(render_warmer_service /bin/bash /opt/cw/replay-warmer.sh /usr/bin v3 /home/u/.cache/prefix-proxy \
+     | grep -q '^Environment=CW_CAPTURE_DIR=/home/u/.cache/prefix-proxy$' && echo yes || echo no)"
+
+describe "bq-318 proxy startup: an unwritable store is fatal, not silent"
+RO="$WORK/readonly-store"
+mkdir -p "$RO"
+chmod 0500 "$RO"
+assert_status "ensureStore throws on an unwritable directory" 1 \
+  node -e 'require(process.argv[1]).ensureStore(process.argv[2] + "/sub")' "$REPO_DIR/prefix-proxy.js" "$RO"
+chmod 0700 "$RO"
+assert_status "and succeeds once it is writable" 0 \
+  node -e 'require(process.argv[1]).ensureStore(process.argv[2] + "/sub")' "$REPO_DIR/prefix-proxy.js" "$RO"
+assert_eq "main() refuses to start rather than proxy without capturing" "yes" \
+  "$(grep -q 'refusing to start — a proxy that cannot capture warms nothing' "$REPO_DIR/prefix-proxy.js" \
+     && echo yes || echo no)"
+
+describe "bq-318 proxy health: degraded until a real capture, and on write failure"
+health() { node -e '
+  const p = require(process.argv[1]);
+  const s = p.newHealthState();
+  Object.assign(s, JSON.parse(process.argv[2]));
+  console.log(JSON.stringify(p.healthReport(s)));
+' "$REPO_DIR/prefix-proxy.js" "$1"; }
+assert_eq "fresh proxy reports no_capture_yet" "degraded no_capture_yet" \
+  "$(health '{}' | jq -r '[.status,.reason] | join(" ")')"
+assert_eq "after a promoted capture it is ok" "ok" \
+  "$(health '{"captures":1}' | jq -r '.status')"
+assert_eq "a write failure degrades it again" "degraded capture_write_failed" \
+  "$(health '{"captures":1,"writeErrors":2}' | jq -r '[.status,.reason] | join(" ")')"
+assert_eq "capture write errors are logged, not swallowed" "yes" \
+  "$(grep -q 'capture write FAILED' "$REPO_DIR/prefix-proxy.js" && echo yes || echo no)"
+
+describe "bq-318 warmer: a store it cannot read is loud and nonzero, not a quiet no-op"
+H="$WORK/home-nostore"
+mkdir -p "$H/.cache"
+printf 'ENABLED=1\n' > "$WORK/config-store"
+assert_status "missing capture store exits 1" 1 \
+  env HOME="$H" CW_CONFIG="$WORK/config-store" CW_CAPTURE_DIR="$H/.cache/nowhere" \
+  bash "$REPO_DIR/replay-warmer.sh"
+assert_eq "and says which directory it looked in" "yes" \
+  "$(grep -q "DEGRADED: capture store $H/.cache/nowhere is missing" "$H/.claude/logs/cache-warmer.log" \
+     && echo yes || echo no)"
+
+describe "bq-318 warmer: recent captures that are all unusable are reported, not skipped"
+H="$WORK/home-unusable"
+CAP="$H/.cache/prefix-proxy"
+mkdir -p "$CAP"
+# A capture with no recoverable session id, and one with no header sidecar.
+jq -nc '{model:"m",max_tokens:32000,messages:[{role:"user",content:"no scratchpad path here"}]}' \
+  > "$CAP/req-nosid-000-msg.json"
+jq -nc '{url:"/v1/messages",headers:{}}' > "$CAP/req-nosid-000-msg.hdrs.json"
+make_capture "$CAP" "req-nohdrs-001-msg" 12121212-1111-2222-3333-444444444444 5
+rm -f "$CAP/req-nohdrs-001-msg.hdrs.json"
+assert_status "all-unusable recent captures exit 1" 1 \
+  env HOME="$H" CW_CONFIG="$WORK/config-store" bash "$REPO_DIR/replay-warmer.sh"
+assert_eq "the log names the count and the store" "yes" \
+  "$(grep -q 'DEGRADED: 2 recent capture(s)' "$H/.claude/logs/cache-warmer.log" && echo yes || echo no)"
+
+describe "bq-318 warmer: one usable capture is enough to stay quiet (positive control)"
+make_capture "$CAP" "req-good-002-msg" 13131313-1111-2222-3333-444444444444 5
+assert_status "a mixed store exits 0" 0 \
+  env HOME="$H" CW_CONFIG="$WORK/config-store" bash "$REPO_DIR/replay-warmer.sh"
+
+# ---------------------------------------------------------------------------
 printf '\n----------------------------------------\n'
 printf 'v3: Passed: %d   Failed: %d\n' "$PASS" "$FAIL"
 ((FAIL == 0))

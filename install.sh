@@ -145,7 +145,7 @@ if [[ $ENGINE == v3 ]]; then
 
   render_proxy_unit "${TOOL_BIN[node]}" "$REPO_DIR/prefix-proxy.js" \
     "$PROXY_PORT" "$CAPTURE_DIR" "$PRUNE_HOURS" >"$UNIT_DIR/prefix-proxy.service"
-  render_warmer_service "$bash_bin" "$REPO_DIR/replay-warmer.sh" "$unit_path" v3 \
+  render_warmer_service "$bash_bin" "$REPO_DIR/replay-warmer.sh" "$unit_path" v3 "$CAPTURE_DIR" \
     >"$UNIT_DIR/cache-warmer.service"
 else
   render_warmer_service "$bash_bin" "$REPO_DIR/cache-warmer.sh" "$unit_path" v2 \

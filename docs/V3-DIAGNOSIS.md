@@ -105,6 +105,11 @@ published until they are:
 - Proxy downtime while a proxied session is mid-conversation → API errors
   until systemd restarts it (Restart=always, 2 s). Sessions launched while the
   proxy is down run direct (guard in bashrc) and are simply unwarmable.
+- The capture store is ONE setting shared by both halves (`CAPTURE_DIR` /
+  `CW_CAPTURE_DIR`, default `~/.cache/prefix-proxy`, written into both units by
+  install.sh). It used to be two independent defaults — the proxy's was
+  `/tmp/prefix-proxy` — so both components could report success while the
+  warmer scanned a directory nothing wrote to (bq-318).
 - `x-claude-code-session-id` ≠ conversation sid (it's some per-process id);
   replay reuses the captured value — works. Semantics of
   `prompt-caching-scope-2026-01-05` unconfirmed.

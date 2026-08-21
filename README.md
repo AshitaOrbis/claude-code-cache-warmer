@@ -106,7 +106,7 @@ directory (`CW_CAPTURE_DIR`, default `~/.cache/prefix-proxy`):
 
 | Unit | What it does |
 |---|---|
-| `prefix-proxy.service` | `node prefix-proxy.js` on `127.0.0.1:8377`, forwarding to api.anthropic.com and capturing each `/v1/messages` request prefix. Supervised (`Restart=always`). Prunes its own captures on a timer — retention does **not** depend on the warmer running. |
+| `prefix-proxy.service` | `node prefix-proxy.js` on `127.0.0.1:8377`, forwarding to api.anthropic.com and capturing each `/v1/messages` request prefix. Supervised (`Restart=always`). Refuses to start if the capture store is not writable, and prunes its own captures on a timer — retention does **not** depend on the warmer running. |
 | `cache-warmer.timer` → `.service` | runs `replay-warmer.sh` every 10 min |
 
 The tool ships **disabled** (`ENABLED=0` in `config`). Before enabling:
@@ -117,6 +117,17 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:8377  # route sessions through it (se
 ./replay-warmer.sh --dry-run                   # preview exactly what it would warm
 $EDITOR config                                 # set ENABLED=1
 ```
+
+### Health
+
+| Endpoint | Meaning |
+|---|---|
+| `GET /warmer-health` | liveness + anti-squatter: answers with this proxy's per-start nonce, which the shell guard below compares against `~/.cache/prefix-proxy/.health-nonce`. Returns **503** when capture writes are failing — routing sessions through a proxy that cannot capture is worse than not routing them. |
+| `GET /warmer-health/json` | `{status, reason, logdir, captures, lastCaptureAt, writeErrors, lastError}`. `degraded`/`no_capture_yet` until a real (upstream-2xx) message capture lands; `degraded`/`capture_write_failed` after a write error. |
+
+`no_capture_yet` deliberately does **not** 503 on the plain endpoint: sessions
+only produce captures by being routed through the proxy, so gating the route on
+a prior capture would deadlock a fresh install. Monitor the JSON endpoint.
 
 Only sessions launched **through the proxy** are warmable — v3 replays a real
 captured request, so a session that never went through it has nothing to
