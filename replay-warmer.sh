@@ -164,11 +164,21 @@ for sid in "${!NEWEST_FILE[@]}"; do
   printf '%s' "$now" > "$STATE_DIR/${sid}.last_attempt"
   sleep $(( RANDOM % 45 ))   # jitter so multi-session warms don't fire as a burst
   log "WARM sid=${sid:0:8} age=${age_min}m cap-age=${cap_age_min}m msgs=$msgs (replay $(basename "$f"))"
-  result=$(python3 "$SCRIPT_DIR/warm-replay.py" "$f" "${f%.json}.hdrs.json" 2>>"$LOG_FILE") || {
+  rc=0
+  result=$(python3 "$SCRIPT_DIR/warm-replay.py" "$f" "${f%.json}.hdrs.json" 2>>"$LOG_FILE") || rc=$?
+  if (( rc == 3 )); then
+    # warm-replay refused to send an UNCAPPED replay (bq-315). That is a
+    # property of this capture's body, not a transient failure — retrying it
+    # inside the warm window would refuse identically, so do NOT roll back
+    # last_attempt the way note_fail does for 401/5xx blips.
+    log "RESULT sid=${sid:0:8} REFUSED uncapped: $(jq -r '.cap_reason // "?"' <<<"$result" 2>/dev/null)"
+    continue
+  fi
+  if (( rc != 0 )); then
     log "RESULT sid=${sid:0:8} FAIL: $(printf '%s' "$result" | head -c 300)"
     note_fail "$sid" "$last_attempt"
     continue
-  }
+  fi
   http=$(jq -r '.http // 0' <<<"$result")
   (( http == 200 )) && rm -f "$STATE_DIR/${sid}.fail_count"
   c_read=$(jq -r '.cache_read // 0' <<<"$result")
@@ -176,7 +186,7 @@ for sid in "${!NEWEST_FILE[@]}"; do
   if (( http == 200 && c_read > 0 && c_create * 4 < c_read )); then
     printf '%s' "$(date +%s)" > "$STATE_DIR/${sid}.last_warm"
     rm -f "$STATE_DIR/${sid}.mismatch_count"
-    log "RESULT sid=${sid:0:8} WARMED cache_read=$c_read cache_creation=$c_create (replay)"
+    log "RESULT sid=${sid:0:8} WARMED cache_read=$c_read cache_creation=$c_create out=$(jq -r '.output_tokens // "aborted"' <<<"$result") cap=$(jq -r '.cap // "none"' <<<"$result") (replay)"
   elif (( http == 200 )); then
     cnt=0; [[ -f $STATE_DIR/${sid}.mismatch_count ]] && cnt=$(<"$STATE_DIR/${sid}.mismatch_count")
     cnt=$((cnt + 1)); printf '%s' "$cnt" > "$STATE_DIR/${sid}.mismatch_count"

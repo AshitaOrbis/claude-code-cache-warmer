@@ -143,6 +143,140 @@ assert_eq "in-window capture retained" "yes" \
   "$([[ -f $CAP/req-recent-002-msg.json ]] && echo yes || echo no)"
 
 # ---------------------------------------------------------------------------
+# bq-315 — replay must not regenerate the original completion uncapped.
+# Driven against a LOCAL fake api.anthropic.com (tests/fake_anthropic.py):
+# no network, no credentials, no cache. What the live API does with a
+# mid-stream disconnect is a separate, un-run release gate — see
+# tests/live-replay-gate.sh.
+# ---------------------------------------------------------------------------
+FAKE_CREDS="$WORK/creds.json"
+jq -nc '{claudeAiOauth: {accessToken: "test-token-not-a-real-credential"}}' > "$FAKE_CREDS"
+
+# start_fake <outdir> -> exports FAKE_URL, sets FAKE_PID
+start_fake() {
+  local out=$1
+  mkdir -p "$out"
+  python3 "$TESTS_DIR/fake_anthropic.py" "$out" &
+  FAKE_PID=$!
+  local i=0
+  while [[ ! -f $out/port ]]; do
+    sleep 0.05
+    i=$((i + 1))
+    ((i < 100)) || { echo "fake server never bound a port" >&2; return 1; }
+  done
+  FAKE_URL="http://127.0.0.1:$(cat "$out/port")"
+}
+stop_fake() { kill "$FAKE_PID" 2>/dev/null || true; wait "$FAKE_PID" 2>/dev/null || true; }
+
+# replay <capture-json> -> stdout is warm-replay.py's JSON line
+replay() {
+  CW_CREDENTIALS="$FAKE_CREDS" CW_REPLAY_ENDPOINT="$FAKE_URL" \
+    python3 "$REPO_DIR/warm-replay.py" "$1" "${1%.json}.hdrs.json"
+}
+
+describe "bq-315 cap: a plain capture is sent with max_tokens=1, prefix bytes untouched"
+S="$WORK/fake-plain"; start_fake "$S"
+CAPD="$WORK/cap-plain"
+make_capture "$CAPD" "req-1-msg" 33333333-3333-3333-3333-333333333333 5
+out=$(replay "$CAPD/req-1-msg.json")
+assert_eq "reported cap is 1" "1" "$(jq -r '.cap' <<<"$out")"
+assert_eq "stream consumed, not aborted (cap already tiny)" "false" "$(jq -r '.aborted' <<<"$out")"
+assert_eq "usage still read from message_start" "71410" "$(jq -r '.cache_read' <<<"$out")"
+assert_eq "server received max_tokens=1" "1" "$(jq -r '.max_tokens' "$S/body.bin")"
+assert_eq "system block byte-identical" \
+  "$(jq -cS '.system' "$CAPD/req-1-msg.json")" "$(jq -cS '.system' "$S/body.bin")"
+assert_eq "messages byte-identical" \
+  "$(jq -cS '.messages' "$CAPD/req-1-msg.json")" "$(jq -cS '.messages' "$S/body.bin")"
+assert_eq "ONLY max_tokens differs from the capture" "{}" \
+  "$(jq -n --slurpfile a "$CAPD/req-1-msg.json" --slurpfile b "$S/body.bin" \
+      '($a[0]|del(.max_tokens)) as $x | ($b[0]|del(.max_tokens)) as $y
+       | if $x == $y then {} else {differs: true} end' | jq -c .)"
+stop_fake
+
+describe "bq-315 cap: extended thinking floors at budget+1, so the stream is ABORTED"
+S="$WORK/fake-think"; start_fake "$S"
+CAPD="$WORK/cap-think"
+think_body=$(jq -nc --arg sp "/tmp/claude-1000/proj/44444444-4444-4444-4444-444444444444/scratchpad" '{
+  model: "claude-opus-5", max_tokens: 32000,
+  thinking: {type: "enabled", budget_tokens: 1024},
+  system: [{type: "text", text: ("Scratchpad Directory\n" + $sp)}],
+  messages: [{role: "user", content: "one"}, {role: "assistant", content: "two"}, {role: "user", content: "three"}]
+}')
+make_capture "$CAPD" "req-1-msg" 44444444-4444-4444-4444-444444444444 5 "$think_body"
+out=$(replay "$CAPD/req-1-msg.json")
+assert_eq "cap is budget_tokens+1 (the API's floor)" "1025" "$(jq -r '.cap' <<<"$out")"
+assert_eq "warm-replay reports it aborted" "true" "$(jq -r '.aborted' <<<"$out")"
+assert_eq "server saw the capped value" "1025" "$(jq -r '.max_tokens' "$S/body.bin")"
+assert_eq "thinking block preserved (cache key)" "1024" "$(jq -r '.thinking.budget_tokens' "$S/body.bin")"
+sleep 0.4
+assert_eq "server observed the client hang up mid-stream" "client_disconnected" "$(cat "$S/result")"
+stop_fake
+
+describe "bq-315 cap: an AMBIGUOUS max_tokens is never guessed at — body sent verbatim, aborted"
+S="$WORK/fake-ambig"; start_fake "$S"
+CAPD="$WORK/cap-ambig"
+ambig_body=$(jq -nc --arg sp "/tmp/claude-1000/proj/55555555-5555-5555-5555-555555555555/scratchpad" '{
+  model: "claude-opus-5", max_tokens: 32000,
+  tools: [{name: "summarize", input_schema: {type: "object", properties: {max_tokens: {type: "integer"}}}}],
+  system: [{type: "text", text: ("Scratchpad Directory\n" + $sp)}],
+  messages: [{role: "user", content: "one"}, {role: "assistant", content: "two"}, {role: "user", content: "three"}]
+}')
+# The tool schema mentions max_tokens but carries no NUMBER, so make it one that does.
+ambig_body=${ambig_body/\"type\":\"integer\"/\"type\":\"integer\",\"max_tokens\":4096}
+make_capture "$CAPD" "req-1-msg" 55555555-5555-5555-5555-555555555555 5 "$ambig_body"
+out=$(replay "$CAPD/req-1-msg.json")
+assert_eq "no cap claimed" "null" "$(jq -r '.cap' <<<"$out")"
+assert_eq "reason names the ambiguity" "yes" \
+  "$(jq -r '.cap_reason' <<<"$out" | grep -q '^ambiguous' && echo yes || echo no)"
+assert_eq "abort is the fallback bound" "true" "$(jq -r '.aborted' <<<"$out")"
+assert_eq "body reached the server byte-identical" "same" \
+  "$(cmp -s "$CAPD/req-1-msg.json" "$S/body.bin" && echo same || echo differs)"
+stop_fake
+
+describe "bq-315 refuse: uncappable AND abort disabled -> exit 3, request never sent"
+S="$WORK/fake-refuse"; start_fake "$S"
+set +e
+out=$(CW_CREDENTIALS="$FAKE_CREDS" CW_REPLAY_ENDPOINT="$FAKE_URL" CW_REPLAY_ABORT=0 \
+        python3 "$REPO_DIR/warm-replay.py" "$WORK/cap-ambig/req-1-msg.json" \
+        "$WORK/cap-ambig/req-1-msg.hdrs.json")
+rc=$?
+set -e
+assert_eq "exit 3 (refused, not a transient failure)" "3" "$rc"
+assert_eq "error is uncapped_refused" "uncapped_refused" "$(jq -r '.error' <<<"$out")"
+assert_eq "nothing was sent upstream" "no" "$([[ -f $S/requests ]] && echo yes || echo no)"
+stop_fake
+
+describe "bq-315 warmer: an exit-3 refusal is logged REFUSED and does NOT roll back last_attempt"
+H="$WORK/home-refuse"
+CAP="$H/.cache/prefix-proxy"
+SID=66666666-6666-6666-6666-666666666666
+make_capture "$CAP" "req-1-msg" "$SID" 50
+BIN="$WORK/bin-refuse"
+mkdir -p "$BIN"
+cat > "$BIN/warm-replay.py" <<'PYSTUB'
+import json, sys
+print(json.dumps({"http": 0, "error": "uncapped_refused", "cap_reason": "ambiguous: 2 max_tokens occurrences in the raw body"}))
+sys.exit(3)
+PYSTUB
+# Run the real script but with a refusing warm-replay.py beside it.
+STAGE="$WORK/stage-refuse"
+mkdir -p "$STAGE"
+cp "$REPO_DIR/replay-warmer.sh" "$STAGE/"
+cp "$BIN/warm-replay.py" "$STAGE/"
+printf 'ENABLED=1\n' > "$WORK/config-refuse"
+mkdir -p "$H/.cache/cache-warmer-v3"
+printf '0' > "$H/.cache/cache-warmer-v3/$SID.last_attempt"
+CW_CONFIG="$WORK/config-refuse" CW_MAX_CAPTURE_AGE_MIN=240 \
+  HOME="$H" bash "$STAGE/replay-warmer.sh"
+LOG="$H/.claude/logs/cache-warmer.log"
+assert_eq "warmer logged REFUSED uncapped" "yes" \
+  "$(grep -q 'REFUSED uncapped' "$LOG" && echo yes || echo no)"
+assert_eq "last_attempt kept (no retry-rollback for a permanent refusal)" "yes" \
+  "$([[ $(cat "$H/.cache/cache-warmer-v3/$SID.last_attempt") != 0 ]] && echo yes || echo no)"
+assert_eq "no failure streak recorded" "no" \
+  "$([[ -f $H/.cache/cache-warmer-v3/$SID.fail_count ]] && echo yes || echo no)"
+
+# ---------------------------------------------------------------------------
 printf '\n----------------------------------------\n'
 printf 'v3: Passed: %d   Failed: %d\n' "$PASS" "$FAIL"
 ((FAIL == 0))

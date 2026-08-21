@@ -51,8 +51,17 @@ Deferred improvements from the 2026-06-11 GPT-5.5 Pro review
 
 - [ ] install.sh: install prefix-proxy.service + repoint cache-warmer.service
       to replay-warmer.sh (currently manual)
-- [ ] Tests/CI for replay-warmer.sh gating + warm-replay.py (v2 test suite
-      covers the fork engine only)
+- [x] Tests/CI for replay-warmer.sh gating + warm-replay.py (v2 test suite
+      covers the fork engine only) — `tests/run-v3.sh`, hermetic (temp HOME,
+      temp capture store, local fake SSE server, stub replay); wired into CI
+      alongside shellcheck for `replay-warmer.sh`.
+- [ ] **Run the live replay gate** (`CW_LIVE=1 tests/live-replay-gate.sh
+      <capture>`): prove a `max_tokens`-capped replay still reads the full
+      cached prefix. Offline tests cannot cover this, and the capping path is
+      not production-trusted until it passes.
+- [ ] **Measure disconnect billing**: what a client hang-up at `message_start`
+      actually costs. Until then no fixed per-warm output-token figure goes in
+      the docs.
 - [ ] Evaluate OTEL_LOG_RAW_API_BODIES as a proxy-less capture source
       (headers still need a source; replay requires exact anthropic-beta +
       x-claude-code-session-id)

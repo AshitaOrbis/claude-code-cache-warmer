@@ -69,10 +69,31 @@ Overnight soak: the timer warms `149d1e07` on its natural 45–58 min window.
 
 ## Cost per warm (v3)
 
-`0.1 × prefix + ~30–40 output tokens` — same economics as the freeze-protocol
+`0.1 × prefix + a bounded completion` — same economics as the freeze-protocol
 model (§4), now with zero mismatch risk: a replay can only read the cache its
 own original request wrote (or re-write it if expired — bounded by the same
 window gating that prevents warming cold sessions).
+
+The earlier "~30–40 output tokens" figure has been **withdrawn** (bq-315): it
+was never measured, and it was not even the right shape — the replay resent the
+capture's own `max_tokens`, thinking budget and task, then consumed the entire
+regenerated answer, so a warm of a long coding turn could bill tens of thousands
+of output tokens. `warm-replay.py` now caps `max_tokens` to the smallest legal
+value with a byte-surgical edit (the prefix bytes that carry the cache key are
+untouched) and aborts the stream at `message_start` — which already carries the
+usage — whenever the cap alone cannot bound the generation, as with an extended
+thinking budget.
+
+Two things remain **unmeasured**, and no per-warm output figure should be
+published until they are:
+
+1. That a capped replay still produces a full cache read against the live API.
+   `max_tokens` should not participate in the cache key, but v3 already learned
+   once that "should not" is not measurement. Gate: `tests/live-replay-gate.sh`
+   (manual, spends real tokens).
+2. What Anthropic bills for a client disconnect mid-stream. The abort bounds
+   wall-clock and bytes on the wire; whether it bounds billed output tokens is
+   unknown.
 
 ## Limitations / open items
 

@@ -33,7 +33,7 @@ jobs:
           shellcheck --version
           shellcheck -x --severity=warning \
             cache-warmer.sh install.sh lib/classify.sh tests/run.sh \
-            replay-warmer.sh tests/run-v3.sh
+            replay-warmer.sh tests/run-v3.sh tests/live-replay-gate.sh
 
       # shfmt format check on the files this repo formats with shfmt (lib/ +
       # tests/). cache-warmer.sh / install.sh predate shfmt adoption and use an
@@ -54,7 +54,8 @@ jobs:
       # Python parsers must byte-compile (syntax + import sanity).
       - name: py_compile
         run: |
-          python3 -m py_compile lib/jsonl.py measure-ttl.py
+          python3 -m py_compile lib/jsonl.py measure-ttl.py \
+            warm-replay.py tests/fake_anthropic.py
 
       # Core-logic test suite (parsing, classification, submit detection).
       # Never forks a live Claude session — pure fixture-driven logic.
