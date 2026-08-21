@@ -336,6 +336,58 @@ assert_eq "uninstall removes the proxy unit too" "yes" \
      | grep -q 'prefix-proxy.service' && echo yes || echo no)"
 
 # ---------------------------------------------------------------------------
+# bq-320 — a typo in the dry-run flag must not execute live replays, and a
+# VALID dry-run must not mutate anything.
+# ---------------------------------------------------------------------------
+describe "bq-320 args: only '', --dry-run and help are accepted"
+H="$WORK/home-args"
+CAP="$H/.cache/prefix-proxy"
+make_capture "$CAP" "req-stale-000-msg" 77777777-7777-7777-7777-777777777777 600
+printf 'ENABLED=1\n' > "$WORK/config-args"
+for bad in --dryrun --dry-run=true -n --dry_run "--dry-run extra"; do
+  # shellcheck disable=SC2086  # the last case deliberately passes two words
+  assert_status "rejects '$bad' with exit 2" 2 \
+    env HOME="$H" CW_CONFIG="$WORK/config-args" bash "$REPO_DIR/replay-warmer.sh" $bad
+done
+assert_eq "a rejected typo pruned NOTHING (refusal precedes every side effect)" "yes" \
+  "$([[ -f $CAP/req-stale-000-msg.json ]] && echo yes || echo no)"
+assert_status "--help exits 0" 0 \
+  env HOME="$H" CW_CONFIG="$WORK/config-args" bash "$REPO_DIR/replay-warmer.sh" --help
+
+describe "bq-320 dry-run: reports without deleting captures or touching state"
+H="$WORK/home-dry"
+CAP="$H/.cache/prefix-proxy"
+SID=88888888-8888-8888-8888-888888888888
+make_capture "$CAP" "req-stale-000-msg" 99999999-9999-9999-9999-999999999999 600
+make_capture "$CAP" "req-warmable-001-msg" "$SID" 50
+STAGE="$WORK/stage-dry"
+mkdir -p "$STAGE"
+cp "$REPO_DIR/replay-warmer.sh" "$STAGE/"
+stub_warm_replay "$STAGE" '{"http":200,"cache_read":71410,"cache_creation":0,"output_tokens":1}'
+printf 'ENABLED=1\n' > "$WORK/config-dry"
+mkdir -p "$H/.cache/cache-warmer-v3"
+touch "$H/.cache/cache-warmer-v3/$SID.mismatch"
+touch -d '30 days ago' "$H/.cache/cache-warmer-v3/$SID.mismatch"
+HOME="$H" CW_CONFIG="$WORK/config-dry" bash "$STAGE/replay-warmer.sh" --dry-run
+assert_eq "aged-out capture SURVIVES a dry run" "yes" \
+  "$([[ -f $CAP/req-stale-000-msg.json ]] && echo yes || echo no)"
+assert_eq "no replay was dispatched" "no" \
+  "$([[ -f $STAGE/calls.log ]] && echo yes || echo no)"
+assert_eq "an expired blacklist entry is NOT cleared by a dry run" "yes" \
+  "$([[ -f $H/.cache/cache-warmer-v3/$SID.mismatch ]] && echo yes || echo no)"
+assert_eq "no last_attempt written" "no" \
+  "$([[ -f $H/.cache/cache-warmer-v3/$SID.last_attempt ]] && echo yes || echo no)"
+assert_eq "it still REPORTED the candidate" "yes" \
+  "$(grep -q '\[dry-run\] would replay-warm' "$H/.claude/logs/cache-warmer.log" && echo yes || echo no)"
+
+describe "bq-320 live run: the same capture IS dispatched without --dry-run"
+HOME="$H" CW_CONFIG="$WORK/config-dry" bash "$STAGE/replay-warmer.sh"
+assert_eq "replay dispatched on a real run" "yes" \
+  "$([[ -f $STAGE/calls.log ]] && echo yes || echo no)"
+assert_eq "aged-out capture pruned on a real run" "no" \
+  "$([[ -f $CAP/req-stale-000-msg.json ]] && echo yes || echo no)"
+
+# ---------------------------------------------------------------------------
 printf '\n----------------------------------------\n'
 printf 'v3: Passed: %d   Failed: %d\n' "$PASS" "$FAIL"
 ((FAIL == 0))

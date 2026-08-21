@@ -38,6 +38,42 @@ LOG_FILE="$HOME/.claude/logs/cache-warmer.log"
 STATE_DIR="$HOME/.cache/cache-warmer-v3"
 CAP_DIR="$HOME/.cache/prefix-proxy"
 UUID_RE='[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}'
+
+usage() {
+  cat <<'USAGE'
+Usage: replay-warmer.sh [--dry-run]
+
+  (no argument)  warm eligible sessions
+  --dry-run      report what WOULD be warmed; touch nothing
+  -h, --help     this text
+USAGE
+}
+
+# Strict argument parsing, BEFORE any side effect (bq-320). The old test was
+# `[[ ${1:-} == --dry-run ]] && DRY=1` with no rejection, so `--dryrun`,
+# `--dry-run=true`, or any other typo silently fell through to a LIVE run —
+# the exact opposite of what the operator asked for, on a tool that spends
+# money. Anything not recognised exits 2 before a single file is touched.
+DRY=0
+case ${1:-} in
+  '') ;;
+  --dry-run) DRY=1 ;;
+  -h | --help)
+    usage
+    exit 0
+    ;;
+  *)
+    echo "replay-warmer.sh: unknown argument '$1'" >&2
+    usage >&2
+    exit 2
+    ;;
+esac
+if (($# > 1)); then
+  echo "replay-warmer.sh: too many arguments (got $#)" >&2
+  usage >&2
+  exit 2
+fi
+
 mkdir -p "$STATE_DIR" "$(dirname "$LOG_FILE")"
 
 ENABLED=0
@@ -61,7 +97,6 @@ for _n in ENABLED WARM_MIN_AGE WARM_MAX_AGE RATELIMIT_MIN MISMATCH_COOLDOWN_DAYS
 done
 [[ -n ${CW_INCLUDE_ONLY_SIDS:-} ]] && INCLUDE_ONLY_SIDS=$CW_INCLUDE_ONLY_SIDS
 
-DRY=0; [[ ${1:-} == --dry-run ]] && DRY=1
 log() { printf '[%s] %s\n' "$(date '+%F %T')" "$*" >> "$LOG_FILE"; }
 
 # A failed replay (401/5xx/network) never touched the cache, so counting it
@@ -94,7 +129,8 @@ prune_captures() {
   find "$CAP_DIR" -maxdepth 1 \( -name 'req-*' -o -name 'pending-*' \) \
     -mmin +$(( PRUNE_HOURS * 60 )) -delete 2>/dev/null || true
 }
-prune_captures
+# --dry-run means "change nothing", and pruning is a deletion (bq-320).
+(( DRY )) || prune_captures
 
 if (( ENABLED != 1 )); then exit 0; fi
 
@@ -123,7 +159,7 @@ for sid in "${!NEWEST_FILE[@]}"; do
   if [[ -f $bl ]]; then
     bl_age=$(( (now - $(stat -c %Y "$bl" 2>/dev/null || echo "$now")) / 86400 ))
     (( bl_age < MISMATCH_COOLDOWN_DAYS )) && continue
-    rm -f "$bl" "$STATE_DIR/${sid}.mismatch_count"
+    (( DRY )) || rm -f "$bl" "$STATE_DIR/${sid}.mismatch_count"
   fi
 
   cap_age_min=$(( (now - cap_mtime) / 60 ))
