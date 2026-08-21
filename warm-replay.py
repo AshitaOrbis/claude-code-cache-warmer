@@ -79,6 +79,12 @@ def plan_minimal_body(body):
         floor = budget + 1  # the API rejects max_tokens <= budget_tokens
 
     current = obj["max_tokens"]
+    if current < 1:
+        # A nonsensical value is not a cap. Reporting it as one would leave
+        # `cap` set, which suppresses the abort fallback — so a malformed body
+        # would be replayed with NEITHER bound. The API rejects it anyway, but
+        # "we have a cap" must never be true when we do not.
+        return body, None, "max_tokens is not a positive integer (%r)" % (current,)
     if current <= floor:
         return body, current, "already minimal"
 

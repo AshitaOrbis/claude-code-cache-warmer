@@ -252,6 +252,26 @@ assert_eq "body reached the server byte-identical" "same" \
   "$(cmp -s "$CAPD/req-1-msg.json" "$S/body.bin" && echo same || echo differs)"
 stop_fake
 
+describe "bq-315 cap planning: only a real top-level positive integer counts as a cap"
+plan() {
+  python3 -c '
+import importlib.util, json, sys
+spec = importlib.util.spec_from_file_location("wr", sys.argv[1])
+wr = importlib.util.module_from_spec(spec); spec.loader.exec_module(wr)
+_, cap, reason = wr.plan_minimal_body(sys.argv[2].encode())
+print(json.dumps({"cap": cap, "reason": reason}))
+' "$REPO_DIR/warm-replay.py" "$1"
+}
+# The single regex hit is NOT the top-level key: the top-level one is written with
+# an escaped underscore, so only a NESTED occurrence is visible in the raw bytes.
+# The occurrence-count guard alone does not catch this — the post-check does.
+assert_eq "a nested-only hit is rejected by the top-level post-check" "null"   "$(plan '{"max\u005ftokens":32000,"tools":[{"input_schema":{"max_tokens":4096}}],"messages":[]}' | jq -r '.cap')"
+assert_eq "duplicate top-level keys read as ambiguous" "null"   "$(plan '{"max_tokens":32000,"messages":[],"max_tokens":32000}' | jq -r '.cap')"
+assert_eq "a non-positive max_tokens is NOT reported as a cap" "null"   "$(plan '{"max_tokens":-5,"messages":[]}' | jq -r '.cap')"
+assert_eq "and says why, so it falls to the abort path" "yes"   "$(plan '{"max_tokens":-5,"messages":[]}' | jq -r '.reason' | grep -q 'not a positive integer' && echo yes || echo no)"
+assert_eq "a float max_tokens is not an int" "null"   "$(plan '{"max_tokens":32000.0,"messages":[]}' | jq -r '.cap')"
+assert_eq "an ordinary capture caps to 1" "1"   "$(plan '{"max_tokens":32000,"messages":[]}' | jq -r '.cap')"
+
 describe "bq-315 refuse: uncappable AND abort disabled -> exit 3, request never sent"
 S="$WORK/fake-refuse"; start_fake "$S"
 set +e
