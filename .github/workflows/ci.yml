@@ -33,7 +33,8 @@ jobs:
           shellcheck --version
           shellcheck -x --severity=warning \
             cache-warmer.sh install.sh lib/classify.sh lib/units.sh tests/run.sh \
-            replay-warmer.sh tests/run-v3.sh tests/live-replay-gate.sh shell-guard.sh
+            replay-warmer.sh tests/run-v3.sh tests/run-burn-queue.sh \
+            tests/live-replay-gate.sh shell-guard.sh
 
       # shfmt format check on the files this repo formats with shfmt (lib/ +
       # tests/). cache-warmer.sh / install.sh predate shfmt adoption and use an
@@ -62,8 +63,8 @@ jobs:
       - name: Run tests
         run: bash tests/run.sh
 
-      # v3 (replay engine) suite: proxy retention, warmer gating, arg parsing,
-      # replay body-capping. Hermetic — temp HOME, stub replay, local fake SSE
-      # server; never calls Anthropic and never runs install.sh.
-      - name: Run v3 tests
+      # v3 plus merged burn-queue suite: proxy retention, v2 discovery, warmer
+      # gating, replay body-capping, and TTL sampling. Hermetic — temp HOME,
+      # stub replay, local fake SSE server; never calls Anthropic/install.sh.
+      - name: Run v3 and burn-queue tests
         run: bash tests/run-v3.sh

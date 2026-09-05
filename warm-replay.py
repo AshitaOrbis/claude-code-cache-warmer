@@ -3,8 +3,9 @@
 
 Usage: warm-replay.py <capture.json> [<capture.hdrs.json>]
 
-Sends the captured body with the captured headers (auth replaced with a fresh
-OAuth token from ~/.claude/.credentials.json). Prints one JSON line:
+Sends a prefix-preserving, output-bounded form of the captured body with the
+cache-relevant headers (auth replaced with a fresh OAuth token from
+~/.claude/.credentials.json). Prints one JSON line:
 {http, cache_read, cache_creation, input_tokens, output_tokens, cap, aborted}.
 
 OUTPUT CAPPING (bq-315)
@@ -35,9 +36,11 @@ Two bounds, applied together:
    enough to just read the tiny response — which is also how output_tokens
    gets measured at all.
 
-If a body can be neither capped nor aborted (CW_REPLAY_ABORT=0 on an
-un-cappable capture) the replay is REFUSED with exit 3 — an uncapped replay is
-the defect, not the fallback.
+If a completion cannot stay below the hard non-abort ceiling, or its required
+abort path is disabled/not explicitly streaming, the replay is REFUSED with
+exit 3. An abort-only non-SSE response (or one with no timely `message_start`)
+is likewise refused without an unbounded drain — an uncapped replay is the
+defect, not the fallback.
 
 RELEASE GATE (unverified here): Anthropic's server-side billing behaviour for a
 client disconnect mid-stream is NOT measured. Until it is, treat the abort path
@@ -52,8 +55,44 @@ import json, os, re, sys, urllib.request, urllib.error
 # at most this many tokens — cheap enough to read, and the only way to actually
 # MEASURE output_tokens per warm.
 DEFAULT_ABORT_ABOVE = 64
+MAX_SSE_PRELUDE_BYTES = 65536
 
 MAX_TOKENS_RE = re.compile(rb'"max_tokens"\s*:\s*(\d+)')
+
+
+class ReplayRefused(Exception):
+    """The requested replay cannot be bounded safely."""
+
+
+def output_bound_plan(cap, abort_enabled, abort_above):
+    """Return whether SSE abort is required, or refuse an unsafe plan."""
+    if not isinstance(abort_above, int) or not 0 <= abort_above <= DEFAULT_ABORT_ABOVE:
+        raise ReplayRefused(
+            "abort threshold must be between 0 and %d" % DEFAULT_ABORT_ABOVE
+        )
+    needs_abort = cap is None or cap > abort_above
+    if needs_abort and not abort_enabled:
+        raise ReplayRefused("completion exceeds the hard non-abort output bound")
+    return needs_abort
+
+
+def request_is_streaming(body):
+    """Return true only when the request explicitly asks for SSE streaming."""
+    try:
+        obj = json.loads(body)
+    except Exception:
+        return False
+    return isinstance(obj, dict) and obj.get("stream") is True
+
+
+def usage_receipt(usage):
+    """Keep absent counters as null so callers cannot mistake them for zero."""
+    value = usage if isinstance(usage, dict) else {}
+    return {
+        'cache_read': value.get('cache_read_input_tokens'),
+        'cache_creation': value.get('cache_creation_input_tokens'),
+        'input_tokens': value.get('input_tokens'),
+    }
 
 
 def plan_minimal_body(body):
@@ -115,10 +154,31 @@ def read_usage(resp, abort_after_start):
     """Drain (or abort) the response, returning (usage, output_tokens, aborted)."""
     usage, out_tokens, aborted = None, None, False
     if "text/event-stream" not in resp.headers.get("content-type", ""):
+        if abort_after_start:
+            # message_start does not exist in a single JSON response. Draining
+            # it would resurrect the full-regeneration defect this abort path
+            # is meant to bound (bq-315/1259/1389).
+            raise ReplayRefused("abort-only replay received a non-streaming response")
         body = json.load(resp)
         usage = body.get("usage", {})
         return usage, usage.get("output_tokens"), False
-    for raw in resp:
+    prelude_bytes = 0
+    while True:
+        if abort_after_start and usage is None:
+            remaining = MAX_SSE_PRELUDE_BYTES - prelude_bytes
+            if remaining <= 0:
+                raise ReplayRefused("message_start exceeded bounded SSE prelude")
+            # HTTPResponse iteration uses an unbounded readline internally.
+            # Bound the read itself (+1 detects overflow) so one newline-free
+            # SSE field cannot allocate/drain an arbitrarily large response.
+            raw = resp.readline(remaining + 1)
+            if len(raw) > remaining:
+                raise ReplayRefused("message_start exceeded bounded SSE prelude")
+            prelude_bytes += len(raw)
+        else:
+            raw = resp.readline()
+        if not raw:
+            break
         line = raw.decode("utf-8", "replace").strip()
         if not line.startswith("data:"):
             continue
@@ -133,6 +193,8 @@ def read_usage(resp, abort_after_start):
                 break
         elif ev.get("type") == "message_delta":
             out_tokens = ev.get("usage", {}).get("output_tokens", out_tokens)
+    if abort_after_start and usage is None:
+        raise ReplayRefused("abort-only SSE ended before message_start")
     return usage, out_tokens, aborted
 
 
@@ -146,11 +208,27 @@ def main():
 
     body, cap, cap_reason = plan_minimal_body(body)
     abort_enabled = os.environ.get('CW_REPLAY_ABORT', '1') != '0'
-    abort_above = int(os.environ.get('CW_REPLAY_ABORT_ABOVE', DEFAULT_ABORT_ABOVE))
-    # Abort whenever the cap alone does not bound the generation.
-    abort_after_start = abort_enabled and (cap is None or cap > abort_above)
-    if cap is None and not abort_after_start:
-        print(json.dumps({'http': 0, 'error': 'uncapped_refused', 'cap_reason': cap_reason}))
+    try:
+        abort_above = int(os.environ.get('CW_REPLAY_ABORT_ABOVE', DEFAULT_ABORT_ABOVE))
+        # The test override may make the abort threshold stricter, never looser
+        # than the hard 64-token drain ceiling (bq-315/1259/1389).
+        abort_after_start = output_bound_plan(cap, abort_enabled, abort_above)
+    except (ValueError, ReplayRefused) as error:
+        print(json.dumps({
+            'http': 0,
+            'error': 'uncapped_refused',
+            'cap': cap,
+            'cap_reason': cap_reason,
+            'detail': str(error),
+        }))
+        sys.exit(3)
+    if abort_after_start and not request_is_streaming(body):
+        print(json.dumps({
+            'http': 0,
+            'error': 'uncapped_non_streaming_refused',
+            'cap': cap,
+            'cap_reason': cap_reason,
+        }))
         sys.exit(3)
 
     # Strip hop-by-hop + stale-length headers; keep the semantic set (betas,
@@ -170,17 +248,23 @@ def main():
     try:
         with urllib.request.urlopen(req, timeout=180) as r:
             usage, out_tokens, aborted = read_usage(r, abort_after_start)
-            u = usage or {}
             print(json.dumps({
                 'http': r.status,
-                'cache_read': u.get('cache_read_input_tokens', 0),
-                'cache_creation': u.get('cache_creation_input_tokens', 0),
-                'input_tokens': u.get('input_tokens', 0),
+                **usage_receipt(usage),
                 'output_tokens': out_tokens,
                 'cap': cap,
                 'cap_reason': cap_reason,
                 'aborted': aborted,
             }))
+    except ReplayRefused as e:
+        print(json.dumps({
+            'http': 0,
+            'error': 'non_streaming_response_refused',
+            'cap': cap,
+            'cap_reason': cap_reason,
+            'detail': str(e),
+        }))
+        sys.exit(3)
     except urllib.error.HTTPError as e:
         print(json.dumps({'http': e.code, 'error': e.read().decode()[:400]}))
         sys.exit(1)

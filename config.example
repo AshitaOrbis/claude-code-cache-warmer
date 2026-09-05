@@ -36,8 +36,7 @@ MISMATCH_COOLDOWN_DAYS=3
 WARM_BYPASS_SESSIONS=1
 
 # Require at least this many REAL user messages before a session qualifies.
-# Filters one-shot `claude -p` cron sessions that share project dirs with
-# interactive TUI sessions.
+# Filters one-shot `claude -p` sessions.
 MIN_USER_MSGS=2
 
 # Extended-regex of session IDs to never warm (empty = none).
@@ -93,3 +92,15 @@ PRUNE_HOURS=6
 # fire as a burst. The warm window is re-checked AFTER the jitter, so a large
 # value costs skipped warms rather than warms sent outside the window.
 MAX_JITTER=45
+
+# A replay is WARMED only when cache reads cover at least this percentage of
+# total input (cache read + cache creation + uncached input). Values below 80
+# are rejected so a partial hit can never advance last_warm.
+MIN_CACHE_READ_PCT=80
+
+# Retry a non-refusal replay failure inside the still-open warm window rather
+# than relying on the next 10-minute timer tick. At most 2 immediate retries
+# are allowed, and a persisted failure streak stops those retries after the
+# third consecutive failure; a later successful HTTP 200 resets the streak.
+REPLAY_RETRIES=2
+RETRY_BACKOFF_SECONDS=2

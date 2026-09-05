@@ -13,9 +13,9 @@
 # (shell profile). Measure your effective TTL with measure-ttl.py and tune
 # WARM_MIN_AGE/WARM_MAX_AGE accordingly. See README.md.
 #
-# Candidates: every session jsonl in the project dirs of currently-running
-# Claude TUI processes, gated by warm window, ≥MIN_USER_MSGS real user
-# messages (filters one-shot `claude -p` cron sessions), and user-idle bound.
+# Candidates: authoritative --resume session IDs from running Claude TUI
+# processes, joined to transcripts by SID rather than a lossy cwd mapping, then
+# gated by warm window, ≥MIN_USER_MSGS real user messages, and user-idle bound.
 #
 # Usage:
 #   cache-warmer.sh            # normal run (systemd timer entry point)
@@ -41,6 +41,7 @@ STATE_DIR="$HOME/.cache/cache-warmer"
 FORK_ARCHIVE_DIR="$STATE_DIR/forks"
 RECEIPTS_FILE="$STATE_DIR/receipts.jsonl"   # structured per-warm receipts (jsonl)
 FORK_TMUX_SESSION="cache-warmer-forks-$(id -u)"
+PROC_ROOT=${CW_PROC_ROOT:-/proc}   # override only for hermetic discovery tests
 UUID_RE='^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'
 SAFE_VALUE_RE='^[A-Za-z0-9._-]+$'
 mkdir -p "$LOG_DIR" "$STATE_DIR" "$FORK_ARCHIVE_DIR"
@@ -86,12 +87,14 @@ done
 [[ $KEEPALIVE_TEXT == *'[cache-warmer keepalive]'* ]] || { echo "config error: KEEPALIVE_TEXT must contain the '[cache-warmer keepalive]' marker (fork-exclusion depends on it)" >&2; exit 2; }
 
 DRY_RUN=0
-case "${1:-}" in
-  --dry-run) DRY_RUN=1 ;;
-  --help|-h) sed -n '2,27p' "$0"; exit 0 ;;
-  "") ;;
-  *) echo "unknown argument: $1 (use --dry-run or --help)" >&2; exit 2 ;;
-esac
+if [[ ${CACHE_WARMER_SOURCE_ONLY:-0} != 1 ]]; then
+  case "${1:-}" in
+    --dry-run) DRY_RUN=1 ;;
+    --help|-h) sed -n '2,27p' "$0"; exit 0 ;;
+    "") ;;
+    *) echo "unknown argument: $1 (use --dry-run or --help)" >&2; exit 2 ;;
+  esac
+fi
 
 log() {
   local tag=""
@@ -140,25 +143,12 @@ write_receipt() {
     >> "$RECEIPTS_FILE" 2>/dev/null || log "note: sid=${sid:0:8} could not append receipt"
 }
 
-if [[ ${ENABLED:-0} != 1 ]]; then
-  exit 0
-fi
-
-# Single-instance lock: a run warming several large sessions can outlast the
-# 10-min timer interval; overlapping runs would fight over fork windows.
-exec 9>"$STATE_DIR/run.lock"
-if ! flock -n 9; then
-  log "skip run: another instance holds the lock"
-  exit 0
-fi
-
 # Kill the current fork window if the script dies mid-warm (systemd stop,
 # logout, error) instead of leaving an orphaned Claude process running.
 CURRENT_WIN=""
 cleanup_current_win() {
   [[ -n $CURRENT_WIN ]] && tmux kill-window -t "$CURRENT_WIN" 2>/dev/null || true
 }
-trap cleanup_current_win EXIT INT TERM HUP
 
 # Last real-user-message epoch + count for a session jsonl. Real = type=user,
 # not a tool result, not meta, not a keepalive. Prints "epoch count".
@@ -202,11 +192,41 @@ live_expected_tokens() {
 # session was launched with any of these, the fork's prefix would diverge and
 # the warm would pay a full cache write to discover it — so we skip instead
 # (see prefix_unreplicable). --model and --permission-mode ARE replicated.
-PREFIX_AFFECTING_UNREPLICATED='--append-system-prompt|--system-prompt|--settings|--add-dir|--agents?|--mcp-config|--strict-mcp-config|--allowed-?[Tt]ools|--disallowed-?[Tt]ools|--betas?'
 
-# True if the live args contain a prefix-affecting flag we can't reproduce.
+# True if the live argv contains a prefix-affecting option we cannot reproduce.
+# Match complete tokens only and stop at `--`; prompt text is data, not flags.
 prefix_unreplicable() {
-  [[ $1 =~ $PREFIX_AFFECTING_UNREPLICATED ]]
+  local -a argv=("$@")
+  local i token name value
+  for ((i = 1; i < ${#argv[@]}; i++)); do
+    token=${argv[$i]}
+    [[ $token == -- ]] && break
+    case "$token" in
+      --model|--permission-mode)
+        # A present option we cannot reproduce exactly is a mismatch, not an
+        # excuse to silently launch with the fork's default value.
+        ((i + 1 < ${#argv[@]})) || return 0
+        value=${argv[$((i + 1))]}
+        [[ $value != --* && $value =~ $SAFE_VALUE_RE ]] || return 0
+        i=$((i + 1))
+        ;;
+      --model=*|--permission-mode=*)
+        value=${token#*=}
+        [[ $value != --* && $value =~ $SAFE_VALUE_RE ]] || return 0
+        ;;
+      *)
+        name=${token%%=*}
+        case "$name" in
+          --append-system-prompt|--system-prompt|--settings|--add-dir|--agent|--agents|\
+          --mcp-config|--strict-mcp-config|--allowed-tools|--allowedTools|\
+          --disallowed-tools|--disallowedTools|--beta|--betas)
+            return 0
+            ;;
+        esac
+        ;;
+    esac
+  done
+  return 1
 }
 
 # Replicate only prefix-relevant, value-validated flags from the live
@@ -215,15 +235,30 @@ prefix_unreplicable() {
 # '=' flag forms. Deliberately NOT replicated: --remote-control,
 # --resume/--continue (we supply our own).
 replicated_flags() {
-  local args=$1 out=""
-  [[ $args == *"--dangerously-skip-permissions"* ]] && out+=" --dangerously-skip-permissions"
-  if [[ $args =~ --model[[:space:]=]+([^[:space:]]+) ]] && [[ ${BASH_REMATCH[1]} =~ $SAFE_VALUE_RE ]]; then
-    out+=" --model ${BASH_REMATCH[1]}"
-  fi
-  if [[ $args =~ --permission-mode[[:space:]=]+([^[:space:]]+) ]] && [[ ${BASH_REMATCH[1]} =~ $SAFE_VALUE_RE ]]; then
-    out+=" --permission-mode ${BASH_REMATCH[1]}"
-  fi
-  echo "$out"
+  local -a argv=("$@")
+  local i token value out=""
+  for ((i = 1; i < ${#argv[@]}; i++)); do
+    token=${argv[$i]}
+    [[ $token == -- ]] && break
+    case "$token" in
+      --dangerously-skip-permissions)
+        out+=" --dangerously-skip-permissions"
+        ;;
+      --model|--permission-mode)
+        ((i + 1 < ${#argv[@]})) || continue
+        value=${argv[$((i + 1))]}
+        [[ $value != --* && $value =~ $SAFE_VALUE_RE ]] || continue
+        out+=" $token $value"
+        i=$((i + 1))
+        ;;
+      --model=*|--permission-mode=*)
+        value=${token#*=}
+        [[ $value != --* && $value =~ $SAFE_VALUE_RE ]] || continue
+        out+=" ${token%%=*} $value"
+        ;;
+    esac
+  done
+  printf '%s\n' "$out"
 }
 
 # Env vars that change the prompt prefix (model selection, system-prompt
@@ -241,7 +276,7 @@ PREFIX_AFFECTING_ENV_RE='^(ANTHROPIC_MODEL|ANTHROPIC_SMALL_FAST_MODEL|ANTHROPIC_
 replicated_env() {
   local pid=$1
   [[ $pid =~ ^[0-9]+$ ]] || return 0
-  local environ="/proc/$pid/environ"
+  local environ="$PROC_ROOT/$pid/environ"
   [[ -r $environ ]] || return 0
   local kv name val out=""
   while IFS= read -r -d '' kv; do
@@ -253,6 +288,171 @@ replicated_env() {
   done < "$environ"
   echo "$out"
 }
+
+# Discovery keeps argv as NUL-delimited tokens until it has proved process
+# identity. A flattened `ps ... args` substring is not evidence that a command
+# is Claude: `tail -f ~/.claude/logs/...` contains the same word (bq-1323).
+PROCESS_EXE=""
+declare -a PROCESS_ARGV=()
+declare -A RESUME_SID_ARGS RESUME_SID_FLAGS RESUME_SID_UNREPLICABLE \
+  RESUME_SID_BYPASS RESUME_SID_CWD RESUME_SID_PID RESUME_SID_ENV \
+  RESUME_SID_AMBIGUOUS
+
+read_process_exe() {
+  local pid=$1
+  PROCESS_EXE=$(readlink -f "$PROC_ROOT/$pid/exe" 2>/dev/null || true)
+  [[ -n $PROCESS_EXE ]]
+}
+
+read_process_argv() {
+  local pid=$1 token
+  PROCESS_ARGV=()
+  [[ -r $PROC_ROOT/$pid/cmdline ]] || return 1
+  while IFS= read -r -d '' token; do
+    PROCESS_ARGV+=("$token")
+  done < "$PROC_ROOT/$pid/cmdline"
+  (( ${#PROCESS_ARGV[@]} > 0 ))
+}
+
+is_known_claude_process() {
+  local exe=$1 base installed="" entrypoint=""
+  shift
+  base=$(basename "$exe")
+
+  # The native installer exposes ~/.local/bin/claude as a symlink to a
+  # version-named ELF, so /proc/<pid>/exe ends in (for example) `2.1.261`.
+  # Authenticate direct/native processes against the exact installed binary;
+  # a different executable merely named `claude` is not authoritative. Do not
+  # depend on argv[0]: native launchers may preserve the symlink name or replace
+  # it with the versioned executable path.
+  installed=$(command -v claude 2>/dev/null || true)
+  installed=$(readlink -f "$installed" 2>/dev/null || true)
+  [[ -n $installed && $installed == "$exe" ]] && return 0
+
+  case "$base" in
+    node|nodejs|bun)
+      # For JS installs the CLI must be argv[1], not an arbitrary data token.
+      entrypoint=${2:-}
+      case "$entrypoint" in
+        */@anthropic-ai/claude-code/cli.js|*/@anthropic-ai/claude-code/cli.mjs|*/claude-code/cli.js|*/claude-code/cli.mjs)
+          return 0
+          ;;
+      esac
+      ;;
+  esac
+  return 1
+}
+
+argv_has_exact() {
+  local wanted=$1 token
+  shift
+  for token in "$@"; do
+    [[ $token == -- ]] && break
+    [[ $token == "$wanted" ]] && return 0
+  done
+  return 1
+}
+
+argv_to_shell_words() {
+  local token quoted out=""
+  for token in "$@"; do
+    printf -v quoted '%q' "$token"
+    out+="${out:+ }$quoted"
+  done
+  printf '%s\n' "$out"
+}
+
+resume_sid_from_argv() {
+  local token sid="" wants_value=0
+  for token in "$@"; do
+    [[ $token == -- ]] && break
+    if (( wants_value )); then sid=$token; break; fi
+    case "$token" in
+      --resume) wants_value=1 ;;
+      --resume=*) sid=${token#--resume=}; break ;;
+    esac
+  done
+  [[ $sid =~ $UUID_RE ]] || return 1
+  printf '%s\n' "$sid"
+}
+
+# Bind a process configuration to its explicit SID, never to its cwd. Multiple
+# TUIs in one directory therefore cannot donate flags/env to each other's
+# transcripts; conflicting claims for the same SID are refused (bq-1021/1318).
+record_authoritative_process() {
+  local pid=$1 cwd=$2 live_env=$3 sid args flags unreplicable=0 bypass=0
+  shift 3
+  sid=$(resume_sid_from_argv "$@") || return 1
+  args=$(argv_to_shell_words "$@")
+  flags=$(replicated_flags "$@")
+  prefix_unreplicable "$@" && unreplicable=1
+  argv_has_exact --dangerously-skip-permissions "$@" && bypass=1
+  [[ -z ${RESUME_SID_AMBIGUOUS[$sid]:-} ]] || return 1
+  if [[ -n ${RESUME_SID_ARGS[$sid]+x} ]]; then
+    if [[ ${RESUME_SID_CWD[$sid]} != "$cwd" || ${RESUME_SID_ARGS[$sid]} != "$args" \
+          || ${RESUME_SID_ENV[$sid]} != "$live_env" ]]; then
+      RESUME_SID_AMBIGUOUS[$sid]=1
+      unset 'RESUME_SID_ARGS[$sid]' 'RESUME_SID_FLAGS[$sid]' \
+        'RESUME_SID_UNREPLICABLE[$sid]' 'RESUME_SID_BYPASS[$sid]' \
+        'RESUME_SID_CWD[$sid]' 'RESUME_SID_PID[$sid]' 'RESUME_SID_ENV[$sid]'
+      return 1
+    fi
+    return 0
+  fi
+  RESUME_SID_ARGS[$sid]=$args
+  RESUME_SID_FLAGS[$sid]=$flags
+  RESUME_SID_UNREPLICABLE[$sid]=$unreplicable
+  RESUME_SID_BYPASS[$sid]=$bypass
+  RESUME_SID_CWD[$sid]=$cwd
+  RESUME_SID_PID[$sid]=$pid
+  RESUME_SID_ENV[$sid]=$live_env
+}
+
+# Locate by authoritative SID across the projects tree. Reconstructing the
+# project directory from cwd is lossy because Claude maps '.', '_', and other
+# characters to '-' as well as '/', and collisions are possible. Exactly one
+# match is required; zero or duplicates fail closed (bq-1022/1201/1324).
+FOUND_SESSION_JSONL=""
+FOUND_SESSION_COUNT=0
+find_session_jsonl() {
+  local sid=$1 projects_root=${2:-"$HOME/.claude/projects"}
+  local -a matches=()
+  FOUND_SESSION_JSONL=""
+  FOUND_SESSION_COUNT=0
+  [[ $sid =~ $UUID_RE && -d $projects_root ]] || return 1
+  mapfile -d '' -t matches < <(find "$projects_root" -type f -name "${sid}.jsonl" -print0 2>/dev/null)
+  FOUND_SESSION_COUNT=${#matches[@]}
+  (( FOUND_SESSION_COUNT == 1 )) || return 1
+  FOUND_SESSION_JSONL=${matches[0]}
+}
+
+# A fingerprint mismatch remains true on every timer tick while the transcript
+# has not advanced beyond the prior warm. The guard itself never updates the
+# stored fingerprint; only an organic write followed by a successful warm may
+# do that (bq-1202/1321).
+binary_drift_blocks() {
+  local last_warm=$1 live_mtime=$2 recorded_fp=$3 current_fp=$4
+  (( last_warm >= live_mtime )) && [[ -n $recorded_fp && $recorded_fp != "$current_fp" ]]
+}
+
+# Tests source the pure discovery/guard helpers without entering runtime
+# discovery or touching any real process/session.
+if [[ ${CACHE_WARMER_SOURCE_ONLY:-0} == 1 ]]; then
+  return 0 2>/dev/null || exit 0
+fi
+
+if [[ ${ENABLED:-0} != 1 ]]; then
+  exit 0
+fi
+
+# Single-instance lock: a run warming several large sessions can outlast the
+# 10-min timer interval; overlapping runs would fight over fork windows.
+exec 9>"$STATE_DIR/run.lock"
+if ! flock -n 9; then
+  log "skip run: another instance holds the lock"
+  exit 0
+fi
+trap cleanup_current_win EXIT INT TERM HUP
 
 # Fingerprint of the `claude` binary: "version|mtime". A binary update shifts
 # the system-prompt prefix (observed across 2.1.173→174), so a fork built with
@@ -269,19 +469,18 @@ claude_binary_fingerprint() {
   echo "${ver:-noversion}|${mt:-0}"
 }
 
-# Warm one session by fork. Args: sid, cwd, live_args, live_jsonl, live_pid,
+# Warm one session by fork. Args: sid, cwd, replicated_flags, live_jsonl, live_pid,
 # live_env. Returns 0 on verified warm, 1 otherwise. Logs RESULT/FAIL itself.
 warm_by_fork() {
-  local sid=$1 cwd=$2 live_args=$3 live_jsonl=$4 live_pid=${5:-} live_env=${6:-}
+  local sid=$1 cwd=$2 flags=$3 live_jsonl=$4 live_pid=${5:-} live_env=${6:-}
   # Derive the project dir from the live jsonl itself — Claude Code mangles
   # more than just '/' in the cwd→dir mapping (e.g. '.' also becomes '-'), so
   # recomputing it from cwd is unreliable. The fork's jsonl lands beside the
   # live one, so dirname is correct by construction.
   local project_dir
   project_dir=$(dirname "$live_jsonl")
-  local flags win rc=1 nonce spawn_epoch pane_pid=""
+  local win rc=1 nonce spawn_epoch pane_pid=""
   [[ $sid =~ $UUID_RE ]] || { log "FAIL sid=${sid:0:8}: not a valid session UUID, refusing to fork"; return 1; }
-  flags=$(replicated_flags "$live_args")
   nonce=$(cat /proc/sys/kernel/random/uuid 2>/dev/null || date +%s%N)
   local keepalive="$KEEPALIVE_TEXT [run=${nonce}]"
   win="$FORK_TMUX_SESSION:w$$-${sid:0:8}"
@@ -518,11 +717,12 @@ fi
 # Code update shifts the system-prompt prefix — see claude_binary_fingerprint).
 CLAUDE_FP_NOW=$(claude_binary_fingerprint)
 
-# Evaluate one candidate session; warm it if due. Args: jsonl, cwd, live_args,
-# live_pid, live_env.
+# Evaluate one candidate session; warm it if due. Args: jsonl, cwd,
+# replicated_flags, has_unreplicable_flag, has_bypass_flag, live_pid, live_env.
 declare -A SEEN_SID
 process_candidate() {
-  local jsonl=$1 cwd=$2 live_args=$3 live_pid=${4:-} live_env=${5:-}
+  local jsonl=$1 cwd=$2 live_flags=$3 live_unreplicable=$4 live_bypass=$5 \
+    live_pid=${6:-} live_env=${7:-}
   # Recompute now — a multi-warm run can take many minutes, and a stale `now`
   # would mis-age later candidates (warming a cold session, false strikes).
   local now; now=$(date +%s)
@@ -561,7 +761,7 @@ process_candidate() {
 
   # Fail closed on prefix-affecting flags we can't reproduce — replaying them
   # wrong pays a full cache write per attempt. Better to skip and say so.
-  if prefix_unreplicable "$live_args"; then
+  if [[ $live_unreplicable == 1 ]]; then
     log "skip sid=${sid:0:8}: live args use a prefix-affecting flag the warmer can't replicate (would mismatch)"
     return 0
   fi
@@ -570,7 +770,7 @@ process_candidate() {
   # --dangerously-skip-permissions it could act on the keepalive without an
   # approval gate. Opt-out gate (default warms them — the prefix must match,
   # so bypass mode has to be replicated; see README "Armed forks").
-  if [[ $WARM_BYPASS_SESSIONS != 1 && $live_args == *"--dangerously-skip-permissions"* ]]; then
+  if [[ $WARM_BYPASS_SESSIONS != 1 && $live_bypass == 1 ]]; then
     log "skip sid=${sid:0:8}: session runs --dangerously-skip-permissions and WARM_BYPASS_SESSIONS=0"
     return 0
   fi
@@ -627,12 +827,11 @@ process_candidate() {
   # newer than our last warm, the live session itself rebuilt the prefix with
   # the current binary, so no drift concern.)
   local bin_file="$STATE_DIR/${sid}.warm_binary"
-  if (( last_warm >= mtime )) && [[ -f $bin_file ]]; then
+  if [[ -f $bin_file ]]; then
     local warm_fp
     warm_fp=$(cat "$bin_file" 2>/dev/null || true)
-    if [[ -n $warm_fp && $warm_fp != "$CLAUDE_FP_NOW" ]]; then
-      log "skip sid=${sid:0:8} age=${age_min}m: claude binary drifted since last warm (${warm_fp%%|*} → ${CLAUDE_FP_NOW%%|*}); refreshing baseline"
-      (( DRY_RUN )) || write_state "$bin_file" "$CLAUDE_FP_NOW"
+    if binary_drift_blocks "$last_warm" "$mtime" "$warm_fp" "$CLAUDE_FP_NOW"; then
+      log "skip sid=${sid:0:8} age=${age_min}m: claude binary drifted since last warm (${warm_fp%%|*} → ${CLAUDE_FP_NOW%%|*}); waiting for newer live activity"
       return 0
     fi
   fi
@@ -642,67 +841,49 @@ process_candidate() {
     return 0
   fi
   write_state "$STATE_DIR/${sid}.last_attempt" "$(date +%s)"
-  if warm_by_fork "$sid" "$cwd" "$live_args" "$jsonl" "$live_pid" "$live_env"; then
+  if warm_by_fork "$sid" "$cwd" "$live_flags" "$jsonl" "$live_pid" "$live_env"; then
     write_state "$STATE_DIR/${sid}.last_warm" "$(date +%s)"
     write_state "$bin_file" "$CLAUDE_FP_NOW"
   fi
 }
 
-# Discover project dirs of running Claude TUI processes (and authoritative
-# --resume sids). Forks and -p/--print processes are never candidates. The
-# live pid and a snapshot of its prefix-affecting env are captured here so the
-# fork can replicate them even if the live process exits before the warm runs.
-declare -A DIR_CWD DIR_ARGS DIR_PID DIR_ENV RESUME_SID_ARGS RESUME_SID_CWD RESUME_SID_PID RESUME_SID_ENV
-while IFS=$'\t' read -r pid tty comm args; do
-  # Match both direct `claude` and wrapper-launched instances (npx/node execing
-  # the CLI) whose argv still names the claude entrypoint.
-  [[ $comm == claude || $args == *"claude"* ]] || continue
+# Discover exact Claude TUI processes from /proc argv/executable identity.
+# Forks and -p/--print processes are never candidates. The live pid and a
+# snapshot of its prefix-affecting env are captured here so the fork can
+# replicate them even if the live process exits before the warm runs.
+while read -r pid tty _comm; do
   [[ $tty != "?" ]] || continue
-  case " $args " in
-    *" -p "*|*" --print "*) continue ;;
-  esac
-  [[ $args == *"--fork-session"* ]] && continue
+  read_process_exe "$pid" || continue
+  read_process_argv "$pid" || continue
+  is_known_claude_process "$PROCESS_EXE" "${PROCESS_ARGV[@]}" || continue
+  argv_has_exact -p "${PROCESS_ARGV[@]}" && continue
+  argv_has_exact --print "${PROCESS_ARGV[@]}" && continue
+  argv_has_exact --fork-session "${PROCESS_ARGV[@]}" && continue
 
-  cwd=$(readlink "/proc/$pid/cwd" 2>/dev/null || true)
+  cwd=$(readlink "$PROC_ROOT/$pid/cwd" 2>/dev/null || true)
   [[ -n $cwd ]] || continue
-  project_dir="$HOME/.claude/projects/${cwd//\//-}"
-  [[ -d $project_dir ]] || continue
   live_env=$(replicated_env "$pid")
-  DIR_CWD[$project_dir]=$cwd
-  DIR_ARGS[$project_dir]=$args
-  DIR_PID[$project_dir]=$pid
-  DIR_ENV[$project_dir]=$live_env
 
-  if [[ $args == *"--resume "* ]]; then
-    rsid=$(printf '%s\n' "$args" | grep -oE -- '--resume [0-9a-f-]+' | awk '{print $2}' | head -1 || true)
-    if [[ -n $rsid && $rsid =~ $UUID_RE ]]; then
-      RESUME_SID_ARGS[$rsid]=$args
-      RESUME_SID_CWD[$rsid]=$cwd
-      RESUME_SID_PID[$rsid]=$pid
-      RESUME_SID_ENV[$rsid]=$live_env
-    fi
+  rsid=$(resume_sid_from_argv "${PROCESS_ARGV[@]}" 2>/dev/null || true)
+  if [[ -z $rsid ]]; then
+    log "skip pid=$pid: Claude TUI has no authoritative --resume session id; directory fallback is disabled"
+    continue
   fi
-done < <(ps -eo pid=,tty=,comm=,args= --no-headers | awk '{pid=$1; tty=$2; comm=$3; $1=$2=$3=""; sub(/^ +/,""); print pid "\t" tty "\t" comm "\t" $0}')
+  if ! record_authoritative_process "$pid" "$cwd" "$live_env" "${PROCESS_ARGV[@]}"; then
+    log "skip sid=${rsid:0:8}: multiple live processes claim it with conflicting cwd, flags, or environment"
+  fi
+done < <(ps -eo pid=,tty=,comm= --no-headers)
 
-# Authoritative --resume sessions first (their jsonl may sit outside the cwd dir).
+# Join each process to exactly one transcript by SID, independent of cwd's
+# lossy project-directory encoding.
 for rsid in "${!RESUME_SID_ARGS[@]}"; do
-  jsonl=$(find "$HOME/.claude/projects" -maxdepth 3 -name "${rsid}.jsonl" 2>/dev/null | head -1 || true)
-  [[ -n $jsonl ]] && process_candidate "$jsonl" "${RESUME_SID_CWD[$rsid]}" "${RESUME_SID_ARGS[$rsid]}" \
-    "${RESUME_SID_PID[$rsid]}" "${RESUME_SID_ENV[$rsid]}"
-done
-
-# Then recent sessions in each active project dir (snapshot the list up front
-# so fork jsonls created mid-run are never scanned; cap at the 10 newest to
-# bound cost). NOTE: this is heuristic — the warmer cannot prove which jsonl
-# belongs to which live TUI, so it may warm a recently-active session in the
-# same dir that no one returns to. The MIN_USER_MSGS, user-idle, and
-# warm-window gates bound that cost; RESULT receipts make it visible.
-for project_dir in "${!DIR_CWD[@]}"; do
-  mapfile -t candidates < <(ls -1t "$project_dir"/*.jsonl 2>/dev/null | head -10 || true)
-  for jsonl in "${candidates[@]}"; do
-    process_candidate "$jsonl" "${DIR_CWD[$project_dir]}" "${DIR_ARGS[$project_dir]}" \
-      "${DIR_PID[$project_dir]}" "${DIR_ENV[$project_dir]}"
-  done
+  if find_session_jsonl "$rsid"; then
+    process_candidate "$FOUND_SESSION_JSONL" "${RESUME_SID_CWD[$rsid]}" \
+      "${RESUME_SID_FLAGS[$rsid]}" "${RESUME_SID_UNREPLICABLE[$rsid]}" \
+      "${RESUME_SID_BYPASS[$rsid]}" "${RESUME_SID_PID[$rsid]}" "${RESUME_SID_ENV[$rsid]}"
+  else
+    log "skip sid=${rsid:0:8}: authoritative SID matched ${FOUND_SESSION_COUNT} transcript files (need exactly one)"
+  fi
 done
 
 # If our fork session is now empty, remove it.

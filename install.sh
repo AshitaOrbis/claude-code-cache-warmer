@@ -161,8 +161,8 @@ fi
 systemctl --user enable --now cache-warmer.timer
 
 if [[ $ENGINE == v3 ]]; then
-  echo "cache-warmer v3 installed — currently INERT (ENABLED=0)."
-  echo "  prefix-proxy.service  capturing to $CAPTURE_DIR (retention ${PRUNE_HOURS}h)"
+  echo "cache-warmer v3 installed — scheduled warming disabled (ENABLED=0)."
+  echo "  prefix-proxy.service  ACTIVE; capturing eligible requests to $CAPTURE_DIR (retention ${PRUNE_HOURS}h)"
   echo "  cache-warmer.timer    replay-warmer.sh every 10 min"
   echo
   echo "Before enabling:"

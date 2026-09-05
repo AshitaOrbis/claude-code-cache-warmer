@@ -48,6 +48,10 @@ assert_status() {
 WORK=$(mktemp -d)
 trap 'rm -rf "$WORK"' EXIT
 
+# New burn-queue regressions are kept offline so fail-closed safety remains
+# testable even where the sandbox forbids loopback sockets.
+bash "$TESTS_DIR/run-burn-queue.sh"
+
 # Pin the inter-warm jitter to zero everywhere except the bq-317 block, which
 # sets it deliberately. Without this the suite would sleep up to 44 s per
 # dispatched warm and its timing assertions would be non-deterministic.
@@ -168,6 +172,7 @@ assert_eq "in-window capture retained" "yes" \
 # mid-stream disconnect is a separate, un-run release gate — see
 # tests/live-replay-gate.sh.
 # ---------------------------------------------------------------------------
+if [[ ${CW_SKIP_LOOPBACK_TESTS:-0} != 1 ]]; then
 FAKE_CREDS="$WORK/creds.json"
 jq -nc '{claudeAiOauth: {accessToken: "test-token-not-a-real-credential"}}' > "$FAKE_CREDS"
 
@@ -216,7 +221,7 @@ describe "bq-315 cap: extended thinking floors at budget+1, so the stream is ABO
 S="$WORK/fake-think"; start_fake "$S"
 CAPD="$WORK/cap-think"
 think_body=$(jq -nc --arg sp "/tmp/claude-1000/proj/44444444-4444-4444-4444-444444444444/scratchpad" '{
-  model: "claude-opus-5", max_tokens: 32000,
+  model: "claude-opus-5", max_tokens: 32000, stream: true,
   thinking: {type: "enabled", budget_tokens: 1024},
   system: [{type: "text", text: ("Scratchpad Directory\n" + $sp)}],
   messages: [{role: "user", content: "one"}, {role: "assistant", content: "two"}, {role: "user", content: "three"}]
@@ -235,7 +240,7 @@ describe "bq-315 cap: an AMBIGUOUS max_tokens is never guessed at — body sent 
 S="$WORK/fake-ambig"; start_fake "$S"
 CAPD="$WORK/cap-ambig"
 ambig_body=$(jq -nc --arg sp "/tmp/claude-1000/proj/55555555-5555-5555-5555-555555555555/scratchpad" '{
-  model: "claude-opus-5", max_tokens: 32000,
+  model: "claude-opus-5", max_tokens: 32000, stream: true,
   tools: [{name: "summarize", input_schema: {type: "object", properties: {max_tokens: {type: "integer"}}}}],
   system: [{type: "text", text: ("Scratchpad Directory\n" + $sp)}],
   messages: [{role: "user", content: "one"}, {role: "assistant", content: "two"}, {role: "user", content: "three"}]
@@ -308,12 +313,15 @@ printf '0' > "$H/.cache/cache-warmer-v3/$SID.last_attempt"
 CW_CONFIG="$WORK/config-refuse" CW_MAX_CAPTURE_AGE_MIN=240 \
   HOME="$H" bash "$STAGE/replay-warmer.sh"
 LOG="$H/.claude/logs/cache-warmer.log"
-assert_eq "warmer logged REFUSED uncapped" "yes" \
-  "$(grep -q 'REFUSED uncapped' "$LOG" && echo yes || echo no)"
+assert_eq "warmer logged a generic output-bound refusal" "yes" \
+  "$(grep -q 'REFUSED output-bound' "$LOG" && echo yes || echo no)"
 assert_eq "last_attempt kept (no retry-rollback for a permanent refusal)" "yes" \
   "$([[ $(cat "$H/.cache/cache-warmer-v3/$SID.last_attempt") != 0 ]] && echo yes || echo no)"
 assert_eq "no failure streak recorded" "no" \
   "$([[ -f $H/.cache/cache-warmer-v3/$SID.fail_count ]] && echo yes || echo no)"
+else
+  describe "bq-315 loopback integration: SKIPPED by CW_SKIP_LOOPBACK_TESTS=1"
+fi
 
 # ---------------------------------------------------------------------------
 # bq-313 — the published install path must not ship the known-broken v2 engine.
@@ -672,7 +680,7 @@ assert_status "a mixed store exits 0" 0 \
 # bq-319 predicate has to survive a malformed capture. Neither is a finding of
 # its own; both are ways the drain could have broken something it did not name.
 # ---------------------------------------------------------------------------
-describe "bq-317 x note_fail: a transient failure still rolls back for an in-window retry"
+describe "bq-317 x note_fail: persistent failure retries in-process, then holds cooldown"
 H="$WORK/home-rollback"
 CAP="$H/.cache/prefix-proxy"
 SID=abababab-1111-2222-3333-444444444444
@@ -680,25 +688,27 @@ make_capture "$CAP" "req-fail-000-msg" "$SID" 50
 STAGE="$WORK/stage-rollback"
 mkdir -p "$STAGE"
 cp "$REPO_DIR/replay-warmer.sh" "$STAGE/"
-# A 401-style transient failure: nonzero exit, but NOT the exit-3 permanent refusal.
+# A 401-style transient failure: nonzero exit, but NOT the exit-3 permanent
+# refusal. It never recovers, so one process must stop after three total calls.
 cat > "$STAGE/warm-replay.py" <<'PYSTUB'
-import json, sys
+import json, pathlib, sys
+p = pathlib.Path(__file__).with_name("attempts")
+n = int(p.read_text()) + 1 if p.exists() else 1
+p.write_text(str(n))
 print(json.dumps({"http": 401, "error": "token expired"}))
 sys.exit(1)
 PYSTUB
 mkdir -p "$H/.cache/cache-warmer-v3"
 printf '111' > "$H/.cache/cache-warmer-v3/$SID.last_attempt"
-HOME="$H" CW_CONFIG="$WORK/config-clock" bash "$STAGE/replay-warmer.sh"
-assert_eq "last_attempt rolled back to the pre-attempt value" "111" \
-  "$(cat "$H/.cache/cache-warmer-v3/$SID.last_attempt")"
-assert_eq "the failure streak was counted" "1" \
+HOME="$H" CW_CONFIG="$WORK/config-clock" CW_RETRY_BACKOFF_SECONDS=0 \
+  bash "$STAGE/replay-warmer.sh"
+assert_eq "one run is bounded to initial attempt plus two retries" "3" \
+  "$(cat "$STAGE/attempts")"
+assert_eq "the third failure holds the actual last_attempt cooldown" "yes" \
+  "$([[ $(cat "$H/.cache/cache-warmer-v3/$SID.last_attempt") != 111 ]] && echo yes || echo no)"
+assert_eq "all three failures were counted" "3" \
   "$(cat "$H/.cache/cache-warmer-v3/$SID.fail_count")"
-assert_eq "and it was logged as a retry, not a giveup" "yes" \
-  "$(grep -q 'RETRY sid=' "$H/.claude/logs/cache-warmer.log" && echo yes || echo no)"
-# Third consecutive failure stops rolling back — the rate-limit cooldown holds.
-HOME="$H" CW_CONFIG="$WORK/config-clock" bash "$STAGE/replay-warmer.sh"
-HOME="$H" CW_CONFIG="$WORK/config-clock" bash "$STAGE/replay-warmer.sh"
-assert_eq "after 3 failures it gives up rather than retrying forever" "yes" \
+assert_eq "after three failures it gives up rather than retrying forever" "yes" \
   "$(grep -q 'GIVEUP sid=' "$H/.claude/logs/cache-warmer.log" && echo yes || echo no)"
 
 describe "bq-319 predicate: a malformed capture fails CLOSED, it does not crash the run"
@@ -769,6 +779,7 @@ printf 'realnonce' > "$NONCEDIR/.health-nonce"
 assert_eq "nonce present but proxy down -> unset" "unset" \
   "$(guard 59999 "$NONCEDIR")"
 # A squatter that answers 200 with the WRONG body must not capture the session.
+if [[ ${CW_SKIP_LOOPBACK_TESTS:-0} != 1 ]]; then
 python3 -c '
 import http.server, threading, sys
 class H(http.server.BaseHTTPRequestHandler):
@@ -784,6 +795,9 @@ while [[ ! -s $WORK/squat.port ]]; do sleep 0.05; done
 assert_eq "a squatter answering 200 with the wrong body -> unset" "unset" \
   "$(guard "$(cat "$WORK/squat.port")" "$NONCEDIR")"
 kill "$SQUAT" 2>/dev/null || true
+else
+  describe "sol-2 squatter loopback fixture: SKIPPED by CW_SKIP_LOOPBACK_TESTS=1"
+fi
 
 describe "sol-3 proxy: an upstream stream error must not be an uncaught exception"
 assert_eq "the upstream response has an error handler" "yes" \

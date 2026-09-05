@@ -7,10 +7,11 @@
 #
 # v3 removes the fork entirely. Sessions launched with
 # ANTHROPIC_BASE_URL=http://127.0.0.1:8377 pass through prefix-proxy.js
-# (systemd: prefix-proxy.service), which captures each /v1/messages request
-# body + headers (auth NEVER persisted) to ~/.cache/prefix-proxy/. To warm a
-# session, this script replays its latest captured request BYTE-FOR-BYTE
-# (warm-replay.py) with a fresh OAuth token — the exact prefix reads from
+# (systemd: prefix-proxy.service), which captures eligible /v1/messages request
+# bodies + headers to ~/.cache/prefix-proxy/; credential-looking transport
+# headers and mcp_servers[].authorization_token are never persisted. To warm a
+# session, this script replays its latest capture with a fresh OAuth token while
+# preserving cache-key-bearing prefix bytes (warm-replay.py) — the prefix reads from
 # cache (0.1x) and the read refreshes the TTL. No tmux, no TUI automation, no
 # fork divergence; immune to config churn and date boundaries by construction.
 # Verified 2026-07-02: replay of a 71k-token prefix -> cache_read=71410,
@@ -26,6 +27,9 @@
 #   MIN_MSGS (3)               skip one-shot `claude -p` captures
 #   PRUNE_HOURS (6)            delete captures older than this (also
 #                              enforced by prefix-proxy.js, independent of ENABLED)
+#   MIN_CACHE_READ_PCT (80)     minimum cached share of total request input
+#   REPLAY_RETRIES (2)          bounded retries after a non-refusal replay failure
+#   RETRY_BACKOFF_SECONDS (2)   delay before each in-process retry
 #
 # Usage: replay-warmer.sh [--dry-run]
 set -euo pipefail
@@ -54,23 +58,24 @@ USAGE
 # the exact opposite of what the operator asked for, on a tool that spends
 # money. Anything not recognised exits 2 before a single file is touched.
 DRY=0
-case ${1:-} in
-  '') ;;
-  --dry-run) DRY=1 ;;
-  -h | --help)
-    usage
-    exit 0
-    ;;
-  *)
-    echo "replay-warmer.sh: unknown argument '$1'" >&2
-    usage >&2
-    exit 2
-    ;;
-esac
 if (($# > 1)); then
   echo "replay-warmer.sh: too many arguments (got $#)" >&2
   usage >&2
   exit 2
+fi
+if (($# == 1)); then
+  case $1 in
+    --dry-run) DRY=1 ;;
+    -h | --help)
+      usage
+      exit 0
+      ;;
+    *)
+      echo "replay-warmer.sh: unknown argument '$1'" >&2
+      usage >&2
+      exit 2
+      ;;
+  esac
 fi
 
 mkdir -p "$STATE_DIR" "$(dirname "$LOG_FILE")"
@@ -85,6 +90,9 @@ INCLUDE_ONLY_SIDS=''
 MAX_CAPTURE_AGE_MIN=240
 MIN_MSGS=3
 MAX_JITTER=45  # seconds; 0..MAX_JITTER of jitter between warms in one run
+MIN_CACHE_READ_PCT=80
+REPLAY_RETRIES=2
+RETRY_BACKOFF_SECONDS=2
 # ONE capture-store setting, shared with prefix-proxy.js (bq-318). The two
 # halves used to default independently — the proxy to /tmp/prefix-proxy, this
 # script to ~/.cache/prefix-proxy — so both could report success while the
@@ -95,11 +103,16 @@ PRUNE_HOURS=6   # captures are only warm-eligible for MAX_CAPTURE_AGE_MIN; don't
 [[ -f $CONFIG_FILE ]] && source "$CONFIG_FILE"
 # Env overrides (testing): CW_<KNOB>
 for _n in ENABLED WARM_MIN_AGE WARM_MAX_AGE RATELIMIT_MIN MISMATCH_COOLDOWN_DAYS \
-          MAX_CAPTURE_AGE_MIN MIN_MSGS PRUNE_HOURS MAX_JITTER; do
+          MAX_CAPTURE_AGE_MIN MIN_MSGS PRUNE_HOURS MAX_JITTER MIN_CACHE_READ_PCT \
+          REPLAY_RETRIES RETRY_BACKOFF_SECONDS; do
   _o="CW_$_n"
   [[ -n ${!_o:-} ]] && declare "$_n=${!_o}"
   [[ ${!_n} =~ ^[0-9]+$ ]] || { echo "config error: $_n must be an integer (got '${!_n}')" >&2; exit 2; }
 done
+(( MIN_CACHE_READ_PCT >= 80 && MIN_CACHE_READ_PCT <= 100 )) \
+  || { echo "config error: MIN_CACHE_READ_PCT must be between 80 and 100" >&2; exit 2; }
+(( REPLAY_RETRIES <= 2 )) \
+  || { echo "config error: REPLAY_RETRIES must be between 0 and 2" >&2; exit 2; }
 [[ -n ${CW_INCLUDE_ONLY_SIDS:-} ]] && INCLUDE_ONLY_SIDS=$CW_INCLUDE_ONLY_SIDS
 CAP_DIR=${CW_CAPTURE_DIR:-$CAPTURE_DIR}
 [[ -n ${CW_EXCLUDE_SIDS:-} ]] && EXCLUDE_SIDS=$CW_EXCLUDE_SIDS
@@ -124,12 +137,12 @@ done
 
 log() { printf '[%s] %s\n' "$(date '+%F %T')" "$*" >> "$LOG_FILE"; }
 
-# A failed replay (401/5xx/network) never touched the cache, so counting it
+# A failed replay (non-200/network) did not produce a verified warm, so counting it
 # against RATELIMIT_MIN pushes the retry past WARM_MAX_AGE and permanently
 # breaks the sid's TTL chain (debug-20260702/FINDINGS.md, "Incident: 04:24
-# 401s"). Restore the pre-attempt last_attempt so the next timer tick can
-# retry while the warm window is still open — at most 2 rollbacks per failure
-# streak; the counter resets on any HTTP 200.
+# 401s"). Restore the pre-attempt last_attempt so an immediate in-process retry
+# remains eligible while the warm window is still open — at most 2 rollbacks
+# per persisted failure streak; the counter resets on any HTTP 200.
 note_fail() {
   local sid=$1 prev=$2 fails=0
   [[ -f $STATE_DIR/$sid.fail_count ]] && fails=$(<"$STATE_DIR/$sid.fail_count")
@@ -137,10 +150,11 @@ note_fail() {
   fails=$((fails + 1)); printf '%s' "$fails" > "$STATE_DIR/$sid.fail_count"
   if (( fails <= 2 )); then
     printf '%s' "$prev" > "$STATE_DIR/$sid.last_attempt"
-    log "RETRY sid=${sid:0:8}: rolled back last_attempt (fail #$fails) — next tick may retry"
+    log "RETRY sid=${sid:0:8}: rolled back last_attempt (fail #$fails) — immediate retry remains eligible"
   else
     log "GIVEUP sid=${sid:0:8}: fail #$fails — keeping rate-limit cooldown"
   fi
+  FAIL_STREAK=$fails
 }
 
 # Prune old captures (bodies hold conversation content — keep the window
@@ -169,7 +183,7 @@ if [[ ! -d $CAP_DIR || ! -r $CAP_DIR ]]; then
 fi
 
 now=$(date +%s)
-declare -A NEWEST_FILE NEWEST_MTIME
+declare -A NEWEST_FILE NEWEST_MTIME NEWEST_ORDER_MS NEWEST_ORDER_SEQ NEWEST_ORDER_NAME
 
 # Group captures by conversation sid (scratchpad path inside the body), while
 # counting how many RECENT captures exist versus how many are actually usable —
@@ -188,8 +202,25 @@ while IFS= read -r f; do
   [[ $sid =~ ^${UUID_RE}$ ]] || continue
   [[ -f ${f%.json}.hdrs.json ]] || continue
   (( recent )) && attributable=$((attributable + 1))
-  if [[ -z ${NEWEST_MTIME[$sid]:-} ]] || (( m > NEWEST_MTIME[$sid] )); then
-    NEWEST_FILE[$sid]=$f; NEWEST_MTIME[$sid]=$m
+  # Capture filenames carry millisecond time plus a per-process sequence. `%Y`
+  # has only whole-second resolution, so it cannot order a fast pair reliably
+  # (bq-1200). Legacy names fall back to mtime with a zero sequence.
+  name=$(basename "$f")
+  order_ms=$((m * 1000)); order_seq=0
+  if [[ $name =~ ^req-([0-9]{1,16})-([0-9]{1,9})-msg\.json$ ]]; then
+    order_ms=$((10#${BASH_REMATCH[1]}))
+    order_seq=$((10#${BASH_REMATCH[2]}))
+  fi
+  if [[ -z ${NEWEST_ORDER_MS[$sid]:-} ]] \
+    || (( order_ms > NEWEST_ORDER_MS[$sid] )) \
+    || { (( order_ms == NEWEST_ORDER_MS[$sid] && order_seq > NEWEST_ORDER_SEQ[$sid] )); } \
+    || { (( order_ms == NEWEST_ORDER_MS[$sid] && order_seq == NEWEST_ORDER_SEQ[$sid] )) \
+         && [[ $name > ${NEWEST_ORDER_NAME[$sid]} ]]; }; then
+    NEWEST_FILE[$sid]=$f
+    NEWEST_MTIME[$sid]=$m
+    NEWEST_ORDER_MS[$sid]=$order_ms
+    NEWEST_ORDER_SEQ[$sid]=$order_seq
+    NEWEST_ORDER_NAME[$sid]=$name
   fi
 done < <(find "$CAP_DIR" -maxdepth 1 -name 'req-*-msg.json' 2>/dev/null)
 
@@ -243,16 +274,26 @@ for sid in "${!NEWEST_FILE[@]}"; do
   [[ $msgs =~ ^[0-9]+$ ]] || msgs=0
   if (( msgs < MIN_MSGS )); then continue; fi
 
-  # SERVER-executed tools (web_search, web_fetch, code_execution, hosted MCP)
-  # would be re-run on Anthropic's infrastructure by a replay — refuse to warm
-  # such captures (GPT-5.5-Pro review P0).
+  # Typed tools fail closed. Untyped user-defined tools and the exact known
+  # client-executed built-ins are safe because no client tool loop runs here;
+  # every server/unknown type (including advisor and tool-search families) is
+  # refused rather than maintained as a porous substring denylist (bq-1255).
   server_tools=$(jq -r '
-      ([.tools // [] | .[] | .type // ""]
-       | map(select(test("web_search|web_fetch|code_execution")))
-       | length)
-      + (if .mcp_servers then 1 else 0 end)' "$f" 2>/dev/null) || server_tools=1
+      ([ (.tools // [])
+         | if type != "array" then error("tools is not an array") else .[] end
+         | if type != "object" then error("tool is not an object")
+           elif has("type") | not then empty
+           else .type as $tool_type
+             | select(($tool_type | type) != "string"
+                      or (["bash_20241022", "bash_20250124",
+                           "computer_20241022", "computer_20250124", "computer_20251124",
+                           "text_editor_20241022", "text_editor_20250124",
+                           "text_editor_20250429", "text_editor_20250728",
+                           "memory_20250818"] | index($tool_type)) == null)
+           end ] | length)
+      + (if has("mcp_servers") then 1 else 0 end)' "$f" 2>/dev/null) || server_tools=1
   if [[ ! $server_tools =~ ^[0-9]+$ ]] || (( server_tools > 0 )); then
-    log "skip sid=${sid:0:8}: capture declares server-side tools (replay would re-execute them)"
+    log "skip sid=${sid:0:8}: capture declares server-side or unknown typed tools (replay refused)"
     continue
   fi
 
@@ -288,42 +329,95 @@ for sid in "${!NEWEST_FILE[@]}"; do
     continue
   fi
 
-  printf '%s' "$now" > "$STATE_DIR/${sid}.last_attempt"
-  log "WARM sid=${sid:0:8} age=${age_min}m cap-age=${cap_age_min}m msgs=$msgs jitter=${jitter}s (replay $(basename "$f"))"
-  rc=0
-  result=$(python3 "$SCRIPT_DIR/warm-replay.py" "$f" "${f%.json}.hdrs.json" 2>>"$LOG_FILE") || rc=$?
-  if (( rc == 3 )); then
-    # warm-replay refused to send an UNCAPPED replay (bq-315). That is a
-    # property of this capture's body, not a transient failure — retrying it
-    # inside the warm window would refuse identically, so do NOT roll back
-    # last_attempt the way note_fail does for 401/5xx blips.
-    log "RESULT sid=${sid:0:8} REFUSED uncapped: $(jq -r '.cap_reason // "?"' <<<"$result" 2>/dev/null)"
-    continue
-  fi
-  if (( rc != 0 )); then
-    log "RESULT sid=${sid:0:8} FAIL: $(printf '%s' "$result" | head -c 300)"
+  # A 10-minute timer cannot provide a second chance near the far edge of a
+  # 13-minute warm window. Retry non-refusal failures in-process, bounded by both
+  # a three-failure streak and a fresh deadline check before every request
+  # (bq-1020).
+  attempt=0
+  replay_succeeded=0
+  replay_refused=0
+  while (( attempt <= REPLAY_RETRIES )); do
+    if (( attempt > 0 )); then sleep "$RETRY_BACKOFF_SECONDS"; fi
+
+    now=$(date +%s)
+    age_min=$(( (now - fresh) / 60 ))
+    if (( age_min < WARM_MIN_AGE || age_min >= WARM_MAX_AGE )); then
+      log "skip sid=${sid:0:8}: retry window closed before dispatch (age=${age_min}m, attempt=$((attempt + 1)))"
+      break
+    fi
+
+    printf '%s' "$now" > "$STATE_DIR/${sid}.last_attempt"
+    log "WARM sid=${sid:0:8} age=${age_min}m cap-age=${cap_age_min}m msgs=$msgs jitter=${jitter}s attempt=$((attempt + 1))/$((REPLAY_RETRIES + 1)) (replay $(basename "$f"))"
+    rc=0
+    result=$(python3 "$SCRIPT_DIR/warm-replay.py" "$f" "${f%.json}.hdrs.json" 2>>"$LOG_FILE") || rc=$?
+    if (( rc == 3 )); then
+      # Request or response shape could not prove a bounded completion. Do not
+      # retry it in this run, and do not mislabel a capped response refusal as
+      # "uncapped" (bq-315/1259/1389).
+      refusal=$(jq -r '[.error // "output_bound_refused", .detail // .cap_reason // "?"] | @tsv' \
+        <<<"$result" 2>/dev/null) || refusal="output_bound_refused\t?"
+      log "RESULT sid=${sid:0:8} REFUSED output-bound: $refusal"
+      replay_refused=1
+      break
+    fi
+
+    http=$(jq -r 'if (.http | type) == "number" and .http == (.http | floor) then .http else 0 end' \
+      <<<"$result" 2>/dev/null) || http=0
+    if (( rc == 0 && http == 200 )); then
+      rm -f "$STATE_DIR/${sid}.fail_count"
+      replay_succeeded=1
+      break
+    fi
+
+    if (( rc != 0 )); then
+      log "RESULT sid=${sid:0:8} FAIL: $(printf '%s' "$result" | head -c 300)"
+    else
+      log "RESULT sid=${sid:0:8} FAIL http=$http: $(printf '%s' "$result" | head -c 300)"
+    fi
     note_fail "$sid" "$last_attempt"
-    continue
-  fi
-  http=$(jq -r '.http // 0' <<<"$result")
-  (( http == 200 )) && rm -f "$STATE_DIR/${sid}.fail_count"
-  c_read=$(jq -r '.cache_read // 0' <<<"$result")
-  c_create=$(jq -r '.cache_creation // 0' <<<"$result")
-  if (( http == 200 && c_read > 0 && c_create * 4 < c_read )); then
+    (( FAIL_STREAK >= 3 || attempt >= REPLAY_RETRIES )) && break
+    log "RETRY sid=${sid:0:8}: retrying in ${RETRY_BACKOFF_SECONDS}s while the warm window remains open"
+    attempt=$((attempt + 1))
+  done
+
+  (( replay_refused )) && continue
+  (( replay_succeeded )) || continue
+
+  # Missing/malformed counters are -1, never an optimistic zero. Limit values
+  # to JSON's exact-integer range so the Bash ratio arithmetic cannot overflow.
+  usage_tsv=$(jq -r '
+      def counter:
+        if type == "number" and . >= 0 and . == floor and . <= 9007199254740991
+        then tostring else "-1" end;
+      [(if has("cache_read") then (.cache_read | counter) else "-1" end),
+       (if has("cache_creation") then (.cache_creation | counter) else "-1" end),
+       (if has("input_tokens") then (.input_tokens | counter) else "-1" end)]
+      | @tsv' <<<"$result" 2>/dev/null) || usage_tsv=$'-1\t-1\t-1'
+  IFS=$'\t' read -r c_read c_create input_tokens <<<"$usage_tsv"
+  total_input=$((c_read + c_create + input_tokens))
+  coverage_pct=0
+  (( total_input > 0 && c_read >= 0 )) && coverage_pct=$((c_read * 100 / total_input))
+
+  # Match v2's verified-full-hit rule: cached tokens must cover at least 80% of
+  # ALL input (read + creation + uncached). A one-token read beside a huge cold
+  # input is PARTIAL and must never advance freshness (bq-1256/1319/1390).
+  if (( c_read > 0 && c_create >= 0 && input_tokens >= 0 && total_input > 0 \
+        && c_read * 100 >= MIN_CACHE_READ_PCT * total_input )); then
     printf '%s' "$(date +%s)" > "$STATE_DIR/${sid}.last_warm"
     rm -f "$STATE_DIR/${sid}.mismatch_count"
-    log "RESULT sid=${sid:0:8} WARMED cache_read=$c_read cache_creation=$c_create out=$(jq -r '.output_tokens // "aborted"' <<<"$result") cap=$(jq -r '.cap // "none"' <<<"$result") (replay)"
-  elif (( http == 200 )); then
+    log "RESULT sid=${sid:0:8} WARMED coverage=${coverage_pct}% cache_read=$c_read cache_creation=$c_create input_tokens=$input_tokens out=$(jq -r '.output_tokens // "aborted"' <<<"$result") cap=$(jq -r '.cap // "none"' <<<"$result") (replay)"
+  else
     cnt=0; [[ -f $STATE_DIR/${sid}.mismatch_count ]] && cnt=$(<"$STATE_DIR/${sid}.mismatch_count")
+    [[ $cnt =~ ^[0-9]+$ ]] || cnt=0
     cnt=$((cnt + 1)); printf '%s' "$cnt" > "$STATE_DIR/${sid}.mismatch_count"
+    result_class=MISMATCH
+    (( c_read > 0 && c_create >= 0 && input_tokens >= 0 && total_input > 0 )) \
+      && result_class=PARTIAL
     if (( cnt >= 2 )); then
       touch "$bl"
-      log "RESULT sid=${sid:0:8} MISMATCH cache_read=$c_read cache_creation=$c_create (2nd) — blacklisting"
+      log "RESULT sid=${sid:0:8} $result_class coverage=${coverage_pct}% threshold=${MIN_CACHE_READ_PCT}% cache_read=$c_read cache_creation=$c_create input_tokens=$input_tokens (2nd) — blacklisting"
     else
-      log "RESULT sid=${sid:0:8} MISMATCH cache_read=$c_read cache_creation=$c_create (1st — replay should never mismatch; investigate)"
+      log "RESULT sid=${sid:0:8} $result_class coverage=${coverage_pct}% threshold=${MIN_CACHE_READ_PCT}% cache_read=$c_read cache_creation=$c_create input_tokens=$input_tokens (1st — freshness NOT advanced)"
     fi
-  else
-    log "RESULT sid=${sid:0:8} FAIL http=$http: $(printf '%s' "$result" | head -c 300)"
-    note_fail "$sid" "$last_attempt"
   fi
 done

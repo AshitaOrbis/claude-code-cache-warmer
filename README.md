@@ -4,8 +4,9 @@
 > — the system prompt now embeds a session-specific scratchpad path, so a fork's
 > prefix can never match its parent's and every warm pays a full cache write
 > for zero hits. **v3 (replay-based) is the engine `./install.sh` installs**:
-> `prefix-proxy.js` + `replay-warmer.sh` + `warm-replay.py`, which replays each
-> session's own captured request byte-for-byte (verified: `cache_read=71383,
+> `prefix-proxy.js` + `replay-warmer.sh` + `warm-replay.py`, which preserves
+> each session's cache-key-bearing prefix bytes while bounding output (the
+> original uncapped form was verified: `cache_read=71383,
 > cache_creation=0`). Diagnosis + v3 architecture: [docs/V3-DIAGNOSIS.md](docs/V3-DIAGNOSIS.md).
 > On an affected version the installer **refuses** `--engine v2` unless you also
 > pass `--force-v2`.
@@ -16,8 +17,8 @@
 >
 > **Status: experimental.** v2 was built and verified on Claude Code v2.1.173 /
 > GNU Linux, 2026-06-11; v3 on v2.1.198, 2026-07-02. Both couple to Claude
-> Code internals that can change between versions. Disabled by default; read
-> this whole README before enabling.
+> Code internals that can change between versions. Scheduled warming is
+> disabled by default; read this whole README before enabling it.
 
 Keep long Claude Code sessions warm in the Anthropic prompt cache — **without
 modifying the sessions**. When an idle session approaches cache expiry, the
@@ -98,7 +99,7 @@ Requires `node` (≥ 18), `python3`, `jq`, and `claude` on PATH.
 ```bash
 git clone https://github.com/AshitaOrbis/claude-code-cache-warmer
 cd claude-code-cache-warmer
-./install.sh        # v3: prefix-proxy.service + a 10-min timer — INERT until enabled
+./install.sh        # v3: active proxy + 10-min warmer timer; warming starts disabled
 ```
 
 That installs **two** systemd user units, both pointed at one shared capture
@@ -106,10 +107,12 @@ directory (`CW_CAPTURE_DIR`, default `~/.cache/prefix-proxy`):
 
 | Unit | What it does |
 |---|---|
-| `prefix-proxy.service` | `node prefix-proxy.js` on `127.0.0.1:8377`, forwarding to api.anthropic.com and capturing each `/v1/messages` request prefix. Supervised (`Restart=always`). Refuses to start if the capture store is not writable, and prunes its own captures on a timer — retention does **not** depend on the warmer running. |
+| `prefix-proxy.service` | `node prefix-proxy.js` on `127.0.0.1:8377`, forwarding to api.anthropic.com and capturing eligible `/v1/messages` request prefixes. Requests containing `mcp_servers[].authorization_token` are forwarded but never written. Supervised (`Restart=always`). Refuses to start if the capture store is not writable, and prunes its own captures on a timer — retention does **not** depend on the warmer running. |
 | `cache-warmer.timer` → `.service` | runs `replay-warmer.sh` every 10 min |
 
-The tool ships **disabled** (`ENABLED=0` in `config`). Before enabling:
+Scheduled warming ships **disabled** (`ENABLED=0` in `config`). The proxy still
+serves and captures eligible requests from any session routed through it; that
+capture/retention path is independent of `ENABLED`. Before enabling warming:
 
 ```bash
 curl -fs http://127.0.0.1:8377/warmer-health   # the proxy answers with its nonce
@@ -129,9 +132,10 @@ $EDITOR config                                 # set ENABLED=1
 only produce captures by being routed through the proxy, so gating the route on
 a prior capture would deadlock a fresh install. Monitor the JSON endpoint.
 
-Only sessions launched **through the proxy** are warmable — v3 replays a real
-captured request, so a session that never went through it has nothing to
-replay. Source the guard rather than hand-rolling one:
+Only sessions launched **through the proxy** can become warmable — v3 needs an
+eligible captured request, so a session that never went through it (or whose
+request carries a hosted-MCP authorization token) has nothing to replay.
+Source the guard rather than hand-rolling one:
 
 ```bash
 # ~/.bashrc
@@ -142,6 +146,10 @@ source /path/to/claude-code-cache-warmer/shell-guard.sh
 non-empty AND the proxy echoes that exact value — so a proxy that is down, a
 missing nonce, a relocated `CW_CAPTURE_DIR`, or a squatter on the port all leave
 your sessions talking to api.anthropic.com directly: unwarmable, but working.
+
+A replay is recorded as `WARMED` only when cached reads cover at least
+`MIN_CACHE_READ_PCT` (default 80%) of total input: cache reads + cache creation
++ uncached input. `PARTIAL` or ambiguous usage never advances `last_warm`.
 
 This used to be a snippet in this README, and it compared `curl` output against
 `cat` output directly. With the proxy down curl prints nothing; with the nonce
@@ -171,21 +179,23 @@ cliff; tune `WARM_MIN_AGE`/`WARM_MAX_AGE` if yours differs.
 ## How it decides what to warm
 
 Every 10 minutes, candidates are the explicit `--resume` session IDs of
-running Claude TUI processes, plus the 10 most-recent session logs in each
-running TUI's project directory. Each candidate must pass ALL gates:
+running Claude TUI processes. The SID is joined directly to exactly one
+transcript; the warmer never guesses from Claude's lossy cwd-to-project-dir
+mapping or applies one TUI's flags to another session. Each candidate must pass
+ALL gates:
 
 | Gate | Default | Why |
 |---|---|---|
 | Cache freshness 45–58 min | `WARM_MIN_AGE`/`WARM_MAX_AGE` | younger = still warm; older = already cold (re-warming would pay a full write for a session nobody may resume) |
 | Last *human* message < 4 h | `MAX_USER_IDLE_MIN=240` | caps spend at ~4–5 warms after you walk away |
-| ≥ 2 real user messages | `MIN_USER_MSGS=2` | filters one-shot `claude -p` cron sessions sharing the project dir |
+| ≥ 2 real user messages | `MIN_USER_MSGS=2` | filters one-shot `claude -p` sessions |
 | ≥ 30 min since last attempt | `RATELIMIT_MIN=30` | failures don't fake freshness, but can't be hammered either |
 
-**Known limitation**: when a session ID can't be read from the process's
-arguments, project-directory scanning cannot prove which log belongs to which
-live TUI — so the warmer may occasionally warm a recently-active session in
-the same directory that nobody returns to. The gates above bound that cost,
-and every spend is visible as a RESULT line. Use `EXCLUDE_SIDS` /
+**Known limitation**: a TUI launched without `--resume <sid>` is skipped because
+the process does not expose an authoritative session ID. This deliberately
+trades warm coverage for identity safety; once that session is later resumed
+explicitly it becomes discoverable. Every spend is visible as a RESULT line.
+Use `EXCLUDE_SIDS` /
 `INCLUDE_ONLY_SIDS` for precise control.
 
 ## Safety mechanics
@@ -252,9 +262,11 @@ tail -f ~/.claude/logs/cache-warmer.log     # decisions + RESULT receipts
 grep -E 'RESULT|FAIL' ~/.claude/logs/cache-warmer.log | tail
 ```
 
-Disable: set `ENABLED=0` in `config` (soft), or
-`systemctl --user disable --now cache-warmer.timer` (hard), or
-`./install.sh --uninstall`.
+Disable **warming**: set `ENABLED=0` in `config` (soft), or
+`systemctl --user disable --now cache-warmer.timer` (hard). Neither stops the
+proxy from serving/capturing already-routed sessions. `./install.sh --uninstall`
+removes both units; stopping the proxy while a live session still targets it
+will interrupt that session's API requests.
 
 ## Caveats
 

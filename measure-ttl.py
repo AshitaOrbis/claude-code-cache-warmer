@@ -43,6 +43,7 @@ MIN_PREFIX_TOKENS = 20_000  # ignore tiny turns; cache effects are noise there
 SPARSE_BUCKET = 5           # warn when a non-empty bucket has fewer than this
 SPARSE_TOTAL = 30           # warn when a whole population has fewer than this
 FORK_ARCHIVE_DIR = os.path.expanduser("~/.cache/cache-warmer/forks")
+KEEPALIVE_MARKER = "[cache-warmer keepalive]"
 
 
 def _safe_mtime(p):
@@ -75,6 +76,35 @@ def parse_since(s):
     return dt
 
 
+def _contains_marker(value):
+    if isinstance(value, str):
+        return KEEPALIVE_MARKER in value
+    if isinstance(value, list):
+        return any(_contains_marker(item) for item in value)
+    if isinstance(value, dict):
+        return any(_contains_marker(item) for item in value.values())
+    return False
+
+
+def is_keepalive_transcript(path):
+    """Return True when any parsed user record contains the warmer marker."""
+    try:
+        with open(path) as fh:
+            for line in fh:
+                try:
+                    record = json.loads(line)
+                except Exception:
+                    continue
+                if record.get("type") != "user":
+                    continue
+                message = record.get("message") or {}
+                if isinstance(message, dict) and _contains_marker(message.get("content")):
+                    return True
+    except OSError:
+        return False
+    return False
+
+
 def collect(max_files, since=None, model_filter=None, project_filter=None):
     """Return (rows, n_files_scanned). rows = list of (gap_min, hit_ratio, model)."""
     rows = []
@@ -92,17 +122,14 @@ def collect(max_files, since=None, model_filter=None, project_filter=None):
         # --project filters on the mangled project dir name (which encodes cwd).
         if project_filter and project_filter not in os.path.dirname(path):
             continue
+        # Forks copy the parent's complete history and append their marker near
+        # the end. Scan parsed user records through EOF: a 4096-byte head probe
+        # misses every fork of a nontrivial session (bq-1023/1322).
+        if is_keepalive_transcript(path):
+            continue
         prev_ts = None
         try:
             with open(path) as fh:
-                head = fh.read(4096)
-                # Exclude cache-warmer fork transcripts: once the warmer runs,
-                # they would inflate the apparent TTL. (Re-armed LIVE sessions
-                # do NOT carry the marker — only the disposable forks do.)
-                # Measure with the warmer DISABLED for the truest reading.
-                if "[cache-warmer keepalive]" in head:
-                    continue
-                fh.seek(0)
                 scanned += 1
                 for line in fh:
                     try:

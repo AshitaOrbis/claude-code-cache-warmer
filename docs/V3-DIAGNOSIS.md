@@ -34,10 +34,12 @@ Byte-level capture of /v1/messages request bodies via a local logging proxy
 Don't reconstruct the prefix — **replay the session's own last request**:
 
 1. `prefix-proxy.service` (node, 127.0.0.1:8377) forwards to
-   api.anthropic.com and captures each /v1/messages request body + headers
+   api.anthropic.com and captures eligible /v1/messages request bodies + headers
    (Authorization/cookie/x-api-key never persisted) to `~/.cache/prefix-proxy/`
-   (mode 600/700; pruned after `PRUNE_HOURS`, default **6 h**). Retention is
-   enforced by the proxy itself — at startup and every 10 min, over both
+   (mode 600/700; pruned after `PRUNE_HOURS`, default **6 h**).
+   Requests containing `mcp_servers[].authorization_token` are forwarded but
+   refused before the first capture write, because the bearer is in the body.
+   Retention is enforced by the proxy itself — at startup and every 10 min, over both
    promoted `req-*` and crash-leftover `pending-*` pairs — so capture bodies
    are bounded even when the warmer is disabled or never runs (bq-314).
    `replay-warmer.sh` sweeps the same store as a second pass.
@@ -46,8 +48,9 @@ Don't reconstruct the prefix — **replay the session's own last request**:
 3. `replay-warmer.sh` (cache-warmer.service now points here) groups captures
    by conversation sid — recovered from the scratchpad path *inside the body*,
    the very string that broke fork-warming — and replays the newest capture
-   byte-for-byte with a fresh OAuth token (`warm-replay.py`). The exact-prefix
-   read (0.1×) refreshes the 1h TTL. Same gating as v2: warm window 45–58 min,
+   with a fresh OAuth token (`warm-replay.py`). Cache-key-bearing prefix bytes
+   remain exact; only the top-level `max_tokens` digits may be rewritten. The
+   prefix read (0.1×) refreshes the 1h TTL. Same gating as v2: warm window 45–58 min,
    240 min max capture age, 30 min rate limit, 2-strike blacklist, MIN_MSGS=3
    filters one-shot `claude -p` captures — counting HUMAN turns, not API
    messages, since a headless job that makes a couple of tool calls otherwise
@@ -57,10 +60,11 @@ Don't reconstruct the prefix — **replay the session's own last request**:
 
 - Guessed beta headers + JSON re-serialization → partial hit
   (`cache_read=23,720 / creation=47,428`).
-- Exact captured headers + raw bytes → **full hit
+- Exact cache-relevant captured headers + raw prefix bytes → **full hit
   (`cache_read=71,410 / creation=0`)**. The real header set includes
   `prompt-caching-scope-2026-01-05` and `x-claude-code-session-id` — replay
-  must reuse them verbatim (only the Authorization token is fresh).
+  reuses them. Hop-by-hop headers are dropped, Authorization is fresh,
+  retry telemetry is reset, and `accept-encoding` is forced to `identity`.
 
 ### Verification (2026-07-02 01:49–01:50)
 
@@ -71,10 +75,11 @@ Overnight soak: the timer warms `149d1e07` on its natural 45–58 min window.
 
 ## Cost per warm (v3)
 
-`0.1 × prefix + a bounded completion` — same economics as the freeze-protocol
-model (§4), now with zero mismatch risk: a replay can only read the cache its
-own original request wrote (or re-write it if expired — bounded by the same
-window gating that prevents warming cold sessions).
+`0.1 × prefix + a bounded completion` — same target economics as the
+freeze-protocol model (§4). A replay is accepted as `WARMED` only when
+`cache_read / (cache_read + cache_creation + input_tokens)` meets
+`MIN_CACHE_READ_PCT` (default 80%); partial or ambiguous results do not advance
+freshness and reach the two-strike blacklist path.
 
 The earlier "~30–40 output tokens" figure has been **withdrawn** (bq-315): it
 was never measured, and it was not even the right shape — the replay resent the
@@ -85,6 +90,11 @@ value with a byte-surgical edit (the prefix bytes that carry the cache key are
 untouched) and aborts the stream at `message_start` — which already carries the
 usage — whenever the cap alone cannot bound the generation, as with an extended
 thinking budget.
+
+The abort fallback is eligible only when the captured request explicitly sets
+`stream: true`. If an abort-only replay receives a non-SSE response or no
+`message_start` within the bounded SSE prelude, it refuses without draining an
+unbounded completion. These cases exit 3 and are never reported as warmed.
 
 Two things remain **unmeasured**, and no per-warm output figure should be
 published until they are:
@@ -114,7 +124,7 @@ published until they are:
   replay reuses the captured value — works. Semantics of
   `prompt-caching-scope-2026-01-05` unconfirmed.
 - RC sessions' prompts may contain the claude.ai session URL
-  (attribution.sessionUrl) — irrelevant to v3 (replay is exact), but relevant
+  (attribution.sessionUrl) — preserved by v3's prefix, but relevant
   if anyone revives fork-based approaches.
 
 ## Convergent prior art
