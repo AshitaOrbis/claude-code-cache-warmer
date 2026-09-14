@@ -6,20 +6,31 @@
   classifies the same validated options it passes to the fork, including both
   `--permission-mode bypassPermissions` forms. The opt-out runs before spawning.
 - **The live gate certified unmeasured completions.** Gate and production share
-  the full-hit rule: at least 80% of total input must be cached reads. The cap
-  gate also requires measured integer output within a positive integer cap and
-  no abort. Disconnect billing remains a separate manual measurement.
-- **Installation ignored existing capture policy.** Config supplies the shared
-  directory and retention, explicit CW_* overrides win, and both units receive
-  the effective values. Invalid settings fail; preserved ENABLED is reported.
-- **Reinstallation left the old proxy running.** Changed code or settings now
-  trigger a controlled restart with the timer stopped, followed by nonce
-  verification against the effective capture directory. `--defer-restart`
-  stages changes and reports restart required. Unchanged installs avoid restart.
-- **Failed guards retained inherited dead routes.** The guard clears its managed
-  endpoint on failure, tracks it across port changes, and preserves unrelated
-  provider URLs. Offline regressions cover all five findings, including installer
-  fixtures with copied repos, temporary HOME and mocked systemctl/curl/tools.
+  the full-hit rule in `lib/receipt.jq`: at least 80% of total input must be
+  cached reads. The cap gate also requires measured integer output within a
+  positive integer cap and no abort. Disconnect billing remains a separate
+  manual measurement. Integer settings are parsed as decimal everywhere, so a
+  zero-prefixed `MIN_CACHE_READ_PCT` no longer means one thing to the range
+  check and another to the classifier.
+- **Installation ignored existing capture policy.** The installer reads the
+  shared `ENABLED`, `CAPTURE_DIR`, `PRUNE_HOURS` and `PROXY_PORT` from config in
+  a subshell, so nothing else the config assigns can change installer state;
+  explicit CW_* overrides win, invalid settings fail, both units receive the
+  effective values, and the preserved `ENABLED` is reported.
+- **Reinstallation left the old proxy running.** Changed code or settings
+  trigger a controlled restart with the timer paused, followed by nonce
+  verification against the effective capture directory. The applied fingerprint
+  is withdrawn before anything that changes what runs and rewritten only after
+  verification, so a failed update cannot be certified by a later rollback.
+  An already-active proxy is enabled too. `--defer-restart` stages changes and
+  reports that a restart is required; any other failure after the timer was
+  paused says the timer is still stopped.
+- **Failed guards retained inherited dead routes.** The guard withdraws a route
+  it exported, marked by `CW_GUARD_ENDPOINT`, including one inherited from a
+  parent shell or left on an old port, and leaves every other provider URL in
+  place, noting one that matches the proxy URL without the marker. Offline
+  regressions in `tests/review-regressions.py` cover all five findings and the
+  follow-up review, with copied repos, a temporary HOME and mocked tools.
 
 ## Unreleased — v3 hardening (GPT-5.6-Pro review, 2026-08-12)
 

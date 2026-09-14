@@ -122,16 +122,35 @@ if [[ ! -f "$REPO_DIR/config" ]]; then
   echo "Created $REPO_DIR/config (ENABLED=0 — the timer runs but does nothing yet)."
 fi
 
-# Same trusted shell config as the warmer, with explicit environment precedence.
-ENABLED=0
-CAPTURE_DIR="$HOME/.cache/prefix-proxy"
-PRUNE_HOURS=6
-PROXY_PORT=8377
-# shellcheck disable=SC1091
-source "$REPO_DIR/config"
-CAPTURE_DIR=${CW_CAPTURE_DIR-$CAPTURE_DIR}
-PRUNE_HOURS=${CW_PRUNE_HOURS-$PRUNE_HOURS}
-PROXY_PORT=${CW_PROXY_PORT-$PROXY_PORT}
+# The shared settings come from the same trusted shell config the warmer
+# sources, but it is read in a subshell: nothing it assigns (ENGINE, UNIT_DIR,
+# DEFER_RESTART, ...) can overwrite a decision this installer already made.
+# Only the four shared settings cross back, one per line, and explicit CW_*
+# overrides still win (bq-1996).
+read_shared_settings() {
+  (
+    ENABLED=0
+    CAPTURE_DIR="$HOME/.cache/prefix-proxy"
+    PRUNE_HOURS=6
+    PROXY_PORT=8377
+    # shellcheck disable=SC1091
+    source "$REPO_DIR/config" >/dev/null || exit 1
+    printf '%s\n' "$ENABLED" "$CAPTURE_DIR" "$PRUNE_HOURS" "$PROXY_PORT"
+  )
+}
+settings=$(read_shared_settings) || {
+  echo "ERROR: could not read the shared settings from $REPO_DIR/config" >&2
+  exit 2
+}
+mapfile -t shared <<<"$settings"
+if ((${#shared[@]} != 4)); then
+  echo "ERROR: $REPO_DIR/config: a shared setting is empty or spans lines" >&2
+  exit 2
+fi
+ENABLED=${shared[0]}
+CAPTURE_DIR=${CW_CAPTURE_DIR-${shared[1]}}
+PRUNE_HOURS=${CW_PRUNE_HOURS-${shared[2]}}
+PROXY_PORT=${CW_PROXY_PORT-${shared[3]}}
 if [[ $CAPTURE_DIR != /* || $CAPTURE_DIR == *$'\n'* || $CAPTURE_DIR == *$'\r'* \
       || ! $PRUNE_HOURS =~ ^[1-9][0-9]*$ || ! $PROXY_PORT =~ ^[1-9][0-9]{0,4}$ \
       || ! $ENABLED =~ ^[01]$ ]] || ((PROXY_PORT > 65535)); then
@@ -156,9 +175,21 @@ unit_path="$unit_path:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/b
 
 bash_bin=$(command -v bash)
 
-# Pause scheduling while the units and the running proxy change (bq-1997).
+# Pause scheduling while the units and the running proxy change (bq-1997). From
+# here until scheduling is restored, any unsuccessful exit says the timer is
+# still stopped instead of leaving that to be discovered.
+timer_paused=0
+report_paused_timer() {
+  local status=$?
+  if ((status != 0 && timer_paused)); then
+    echo "NOTE: this install stopped cache-warmer.timer and it is still stopped." >&2
+    echo "      Fix the error above, then re-run ./install.sh to verify the proxy and restore it." >&2
+  fi
+}
+trap report_paused_timer EXIT
 if systemctl --user is-active --quiet cache-warmer.timer; then
   systemctl --user stop cache-warmer.timer
+  timer_paused=1
 fi
 
 if [[ $ENGINE == v3 ]]; then
@@ -178,26 +209,35 @@ fi
 
 render_timer >"$UNIT_DIR/cache-warmer.timer"
 
-# Stop scheduling before changing the running capture policy. The applied hash
-# advances only after health verification, so a failed/deferred run is retried.
 systemctl --user daemon-reload
 if [[ $ENGINE == v3 ]]; then
+  # prefix-proxy.applied names the code and settings the RUNNING proxy was
+  # verified to have. It is withdrawn before anything that can change what runs
+  # (a restart, a start, or unit files a later restart would pick up) and
+  # rewritten only after verification, so a failed or deferred update can never
+  # be certified later by an older fingerprint that happens to match again.
   fingerprint=$(cat "$UNIT_DIR/prefix-proxy.service" "$REPO_DIR/prefix-proxy.js" | sha256sum)
   applied=""
   [[ ! -f $UNIT_DIR/prefix-proxy.applied ]] || applied=$(<"$UNIT_DIR/prefix-proxy.applied")
   if systemctl --user is-active --quiet prefix-proxy.service; then
+    # Active is not enabled: a proxy started by hand would not come back at the
+    # next login, while the timer enabled below would.
+    systemctl --user enable prefix-proxy.service
     if [[ $fingerprint != "$applied" ]]; then
+      rm -f "$UNIT_DIR/prefix-proxy.applied"
       if ((DEFER_RESTART)); then
-        echo "restart required: proxy updates staged; timer stopped. Re-run install.sh when requests can be interrupted."
+        timer_paused=0 # the message says so
+        echo "restart required: proxy updates staged; cache-warmer.timer stopped. Re-run ./install.sh when in-flight requests can be interrupted."
         exit 0
       fi
       systemctl --user restart prefix-proxy.service
     fi
   else
+    rm -f "$UNIT_DIR/prefix-proxy.applied"
     systemctl --user enable --now prefix-proxy.service
   fi
   verified=0
-  # Allow for node start-up and the proxy's store-writability probe (~5s).
+  # Up to 25 probes, each allowed 1s plus a 0.2s pause (~30s worst case).
   for ((attempt = 0; attempt < 25; attempt++)); do
     nonce=$(cat "$CAPTURE_DIR/.health-nonce" 2>/dev/null) || nonce=""
     live=$(curl -fs --max-time 1 "http://127.0.0.1:$PROXY_PORT/warmer-health" 2>/dev/null) || live=""
@@ -208,12 +248,14 @@ if [[ $ENGINE == v3 ]]; then
     sleep 0.2
   done
   if ((verified == 0)); then
-    echo "ERROR: proxy nonce verification failed; timer remains stopped; restart required" >&2
+    timer_paused=0 # the message says so
+    echo "ERROR: proxy nonce verification failed; cache-warmer.timer remains stopped; re-run ./install.sh" >&2
     exit 1
   fi
   printf '%s\n' "$fingerprint" > "$UNIT_DIR/prefix-proxy.applied"
 fi
 systemctl --user enable --now cache-warmer.timer
+timer_paused=0
 
 warming_state=disabled
 [[ $ENABLED != 1 ]] || warming_state=enabled

@@ -153,10 +153,13 @@ source /path/to/claude-code-cache-warmer/shell-guard.sh
 
 `shell-guard.sh` exports `ANTHROPIC_BASE_URL` only when the nonce file is
 non-empty AND the proxy echoes that exact value — so a proxy that is down, a
-missing nonce, a relocated `CW_CAPTURE_DIR`, or a squatter on the port clears
-a previously guard-managed route, including one inherited from a parent shell.
-The exported `CW_GUARD_ENDPOINT` marker tracks that route across port changes.
-Unrelated intentional provider URLs are left untouched on failed checks.
+missing nonce, a relocated `CW_CAPTURE_DIR`, or a squatter on the port withdraws
+a route the guard itself exported, including one inherited from a parent shell
+or left on an old port: the guard exports `CW_GUARD_ENDPOINT` beside the route
+as its ownership marker. Any other `ANTHROPIC_BASE_URL` is left untouched. One
+that equals the proxy URL but carries no marker (a shell that ran an older
+guard, or a different local provider on that port) is also left in place, with
+a one-line notice on stderr.
 
 A replay is recorded as `WARMED` only when cached reads cover at least
 `MIN_CACHE_READ_PCT` (default 80%) of total input: cache reads + cache creation

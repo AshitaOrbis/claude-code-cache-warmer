@@ -108,6 +108,10 @@ for _n in ENABLED WARM_MIN_AGE WARM_MAX_AGE RATELIMIT_MIN MISMATCH_COOLDOWN_DAYS
   _o="CW_$_n"
   [[ -n ${!_o:-} ]] && declare "$_n=${!_o}"
   [[ ${!_n} =~ ^[0-9]+$ ]] || { echo "config error: $_n must be an integer (got '${!_n}')" >&2; exit 2; }
+  # Decimal, always. Bash arithmetic reads a leading zero as octal while jq's
+  # --argjson reads the same text as decimal, so MIN_CACHE_READ_PCT=0120 passed
+  # the range check below as 80 and then failed every receipt as 120.
+  declare "$_n=$((10#${!_n}))"
 done
 (( MIN_CACHE_READ_PCT >= 80 && MIN_CACHE_READ_PCT <= 100 )) \
   || { echo "config error: MIN_CACHE_READ_PCT must be between 80 and 100" >&2; exit 2; }

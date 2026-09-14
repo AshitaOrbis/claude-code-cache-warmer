@@ -16,7 +16,7 @@ class Review(unittest.TestCase):
         self.base = Path(self.temp.name)
         self.repo = self.base / 'repo'
         self.repo.mkdir()
-        for name in ('install.sh', 'cache-warmer.sh', 'shell-guard.sh', 'prefix-proxy.js', 'config.example'):
+        for name in ('install.sh', 'cache-warmer.sh', 'replay-warmer.sh', 'shell-guard.sh', 'prefix-proxy.js', 'config.example'):
             shutil.copy2(ROOT / name, self.repo / name)
         (self.repo / 'lib').mkdir()
         for name in ('units.sh', 'classify.sh', 'jsonl.py', 'receipt.jq'):
@@ -35,6 +35,7 @@ class Review(unittest.TestCase):
         self.fake('node', 'exit 0')
         self.fake('claude', 'echo 2.1.200')
         self.fake('systemctl', '''echo "$*" >> "$CALLS"
+if [[ $* == *daemon-reload* && ${FAIL_RELOAD:-0} == 1 ]]; then echo "mock reload failure" >&2; exit 1; fi
 if [[ $* == *is-active* ]]; then [[ -f "$HOME/active" ]]; exit; fi
 if [[ $* == *'restart prefix-proxy.service'* || $* == *'enable --now prefix-proxy.service'* ]]; then
   mkdir -p "$NONCE_DIR"; echo nonce > "$NONCE_DIR/.health-nonce"; touch "$HOME/active"
@@ -151,7 +152,7 @@ fi''')
                 if condition == 'missing':
                     nonce.unlink()
                 self.fake('curl', 'exit 1' if condition == 'probe' else 'echo wrong')
-                r = self.run_shell('source shell-guard.sh; echo "${ANTHROPIC_BASE_URL-unset}"', CW_CAPTURE_DIR=str(directory), ANTHROPIC_BASE_URL='http://127.0.0.1:8377')
+                r = self.run_shell('source shell-guard.sh; echo "${ANTHROPIC_BASE_URL-unset}"', CW_CAPTURE_DIR=str(directory), ANTHROPIC_BASE_URL='http://127.0.0.1:8377', CW_GUARD_ENDPOINT='http://127.0.0.1:8377')
                 self.assertEqual(r.stdout.strip(), 'unset')
         self.fake('curl', 'echo nonce')
         nonce.write_text('nonce')
@@ -160,6 +161,69 @@ fi''')
         nonce.unlink()
         r = self.run_shell('source shell-guard.sh; echo "$ANTHROPIC_BASE_URL"', CW_CAPTURE_DIR=str(directory), ANTHROPIC_BASE_URL='https://intentional.example')
         self.assertEqual(r.stdout.strip(), 'https://intentional.example')
+
+    def test_bq_1996_config_cannot_overwrite_installer_state(self):
+        """bq-1996: config assignments beyond the shared settings stay in the config's own scope"""
+        self.config(f'ENGINE=v2\nUNIT_DIR="{self.home}/alternate-units"\nDEFER_RESTART=1\nREPO_DIR=/nonexistent\n')
+        r = self.install()
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn('cache-warmer v3 installed', r.stdout)
+        self.assertNotIn('restart required', r.stdout)
+        self.assertTrue((self.home / '.config/systemd/user/prefix-proxy.service').exists())
+        self.assertFalse((self.home / 'alternate-units').exists())
+
+    def test_bq_1997_failed_update_cannot_be_certified_by_rollback(self):
+        """bq-1997: a failed or deferred update withdraws the applied fingerprint"""
+        calls = self.base / 'calls'
+        self.config()
+        self.assertEqual(self.install().returncode, 0)
+        self.config('PRUNE_HOURS=2\n')
+        self.assertNotEqual(self.install(BAD_HEALTH='1').returncode, 0)
+        self.config()                      # roll the setting back to the verified value
+        calls.write_text('')
+        self.assertEqual(self.install().returncode, 0)
+        self.assertIn('restart prefix-proxy.service', calls.read_text())
+        self.config('PRUNE_HOURS=3\n')
+        self.assertIn('restart required', self.install('--defer-restart').stdout)
+        self.config()
+        calls.write_text('')
+        self.assertEqual(self.install().returncode, 0)
+        self.assertIn('restart prefix-proxy.service', calls.read_text())
+
+    def test_bq_1997_active_proxy_is_enabled_for_future_logins(self):
+        """bq-1997: an already-active proxy is enabled, not only restarted"""
+        calls = self.base / 'calls'
+        self.config()
+        self.assertEqual(self.install().returncode, 0)
+        calls.write_text('')
+        self.assertEqual(self.install().returncode, 0)
+        self.assertIn('--user enable prefix-proxy.service', calls.read_text().splitlines())
+
+    def test_bq_1997_intermediate_failure_reports_the_stopped_timer(self):
+        """bq-1997: an error after the timer is paused says it is still stopped"""
+        self.config()
+        self.assertEqual(self.install().returncode, 0)
+        r = self.install(FAIL_RELOAD='1')
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn('stop cache-warmer.timer', (self.base / 'calls').read_text())
+        self.assertIn('cache-warmer.timer and it is still stopped', r.stderr)
+
+    def test_bq_1998_unmarked_matching_route_is_left_with_a_notice(self):
+        """bq-1998: a matching URL without the marker is not assumed to be the guard's"""
+        directory = self.home / 'captures'
+        directory.mkdir()
+        r = self.run_shell('source shell-guard.sh; echo "${ANTHROPIC_BASE_URL-unset}"', CW_CAPTURE_DIR=str(directory), ANTHROPIC_BASE_URL='http://127.0.0.1:8377')
+        self.assertEqual(r.stdout.strip(), 'http://127.0.0.1:8377')
+        self.assertIn('was not set by this guard', r.stderr)
+
+    def test_bq_1995_integer_settings_are_decimal(self):
+        """bq-1995: a zero-prefixed threshold means the same to the range check and the classifier"""
+        for value, refused in (('0120', True), ('080', False)):
+            with self.subTest(value=value):
+                config = self.base / f'warmer-config-{value}'
+                config.write_text(f'ENABLED=0\nMIN_CACHE_READ_PCT={value}\n')
+                r = self.run_shell('bash replay-warmer.sh --dry-run', CW_CONFIG=str(config))
+                self.assertEqual('MIN_CACHE_READ_PCT must be between 80 and 100' in r.stderr, refused, r.stderr)
 
 
 if __name__ == '__main__':
