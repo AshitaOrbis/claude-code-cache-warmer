@@ -156,10 +156,30 @@ non-empty AND the proxy echoes that exact value — so a proxy that is down, a
 missing nonce, a relocated `CW_CAPTURE_DIR`, or a squatter on the port withdraws
 a route the guard itself exported, including one inherited from a parent shell
 or left on an old port: the guard exports `CW_GUARD_ENDPOINT` beside the route
-as its ownership marker. Any other `ANTHROPIC_BASE_URL` is left untouched. One
-that equals the proxy URL but carries no marker (a shell that ran an older
-guard, or a different local provider on that port) is also left in place, with
-a one-line notice on stderr.
+as its ownership marker.
+
+Any other `ANTHROPIC_BASE_URL` is left untouched, **including when the proxy is
+healthy**: the guard selects the capture proxy only when nothing else has
+selected a route, and a shell that already points at another provider keeps it
+and gets a one-line notice on stderr saying it will not be captured (the notice
+never repeats the URL — a base URL can carry credentials). One that equals the
+proxy URL but carries no marker of its own (a shell that ran an older guard, a
+different local provider on that port, or a route replaced by hand beside a
+marker from another port) is also left in place, and is never claimed by this
+guard; if the proxy is down that case gets its own notice, since the guard
+cannot withdraw a route it did not export. Neither notice repeats a URL.
+
+The guard resolves *where* to look the way the installer resolved it. An
+explicit `CW_CAPTURE_DIR` / `CW_PROXY_PORT` in the shell wins; otherwise it
+follows the settings `install.sh` publishes to
+`~/.config/systemd/user/prefix-proxy.settings` once it has verified a live
+proxy against them; otherwise the built-in defaults. That record is read line
+by line and re-validated — never sourced into your shell — and it is written
+only after a nonce check passes, so `--defer-restart` leaves the running
+proxy's settings in place, a failed verification withdraws them, and both
+`--uninstall` and a v2 install remove them. Without it, installing a custom
+capture directory or port and then sourcing the guard in a fresh shell left
+that shell unrouted and uncaptured.
 
 A replay is recorded as `WARMED` only when cached reads cover at least
 `MIN_CACHE_READ_PCT` (default 80%) of total input: cache reads + cache creation

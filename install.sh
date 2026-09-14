@@ -43,7 +43,8 @@ while (($#)); do
       systemctl --user disable --now cache-warmer.timer 2>/dev/null || true
       systemctl --user disable --now prefix-proxy.service 2>/dev/null || true
       rm -f "$UNIT_DIR/cache-warmer.service" "$UNIT_DIR/cache-warmer.timer" \
-        "$UNIT_DIR/prefix-proxy.service" "$UNIT_DIR/prefix-proxy.applied"
+        "$UNIT_DIR/prefix-proxy.service" "$UNIT_DIR/prefix-proxy.applied" \
+        "$UNIT_DIR/prefix-proxy.settings"
       systemctl --user daemon-reload 2>/dev/null ||
         echo "WARNING: user systemd daemon-reload failed (units removed anyway)"
       echo "cache-warmer units removed."
@@ -185,8 +186,16 @@ bash_bin=$(command -v bash)
 # here until scheduling is restored, any unsuccessful exit says the timer is
 # still stopped instead of leaving that to be discovered.
 timer_paused=0
+# Both of these are read by the EXIT trap below, so both are set BEFORE it is
+# installed: an inherited environment variable of the same name would otherwise
+# be treated as a temporary file this run created, and deleted on the way out.
+settings_tmp=""
 report_paused_timer() {
   local status=$?
+  # A settings record half-published below leaves its temporary file behind.
+  # Only ever the path mktemp handed THIS run: the variable starts empty and is
+  # cleared again the moment the record is published.
+  [[ -z $settings_tmp ]] || rm -f "$settings_tmp"
   if ((status != 0 && timer_paused)); then
     echo "NOTE: this install stopped cache-warmer.timer and it is still stopped." >&2
     echo "      Fix the error above, then re-run ./install.sh to verify the proxy and restore it." >&2
@@ -220,6 +229,9 @@ if [[ $ENGINE == v3 ]]; then
   render_warmer_service "$bash_bin" "$REPO_DIR/replay-warmer.sh" "$unit_path" v3 "$CAPTURE_DIR" "$PRUNE_HOURS" \
     >"$UNIT_DIR/cache-warmer.service"
 else
+  # v2 forks sessions; there is no capture proxy for the shell guard to route
+  # to, so any settings a previous v3 install published stop being true here.
+  rm -f "$UNIT_DIR/prefix-proxy.settings"
   render_warmer_service "$bash_bin" "$REPO_DIR/cache-warmer.sh" "$unit_path" v2 \
     >"$UNIT_DIR/cache-warmer.service"
 fi
@@ -257,10 +269,37 @@ if [[ $ENGINE == v3 ]]; then
   done
   if ((verified == 0)); then
     timer_paused=0 # the message says so
+    # The proxy we just started did not answer for these settings, so the
+    # settings on file describe nothing that was verified. Withdraw them rather
+    # than leave the shell guard routing at a proxy we could not confirm.
+    rm -f "$UNIT_DIR/prefix-proxy.settings"
     echo "ERROR: proxy nonce verification failed; cache-warmer.timer remains stopped; re-run ./install.sh" >&2
     exit 1
   fi
   printf '%s\n' "$fingerprint" > "$UNIT_DIR/prefix-proxy.applied"
+  # The third consumer of these settings is the shell guard, and it is the one
+  # that used to resolve them independently (bq-2473). Publish the values this
+  # proxy was just verified against, so a fresh shell routes to the same place.
+  # Only HERE: a staged --defer-restart leaves the previously verified proxy
+  # running and its record untouched, and a failed verification withdraws it —
+  # what is published has always been checked against a live nonce.
+  # mktemp, not a name built from $$: a pathname that already exists would be
+  # truncated rather than created, keeping whatever mode it had, and a symlink
+  # left there would be followed — writing through it and then publishing the
+  # link itself as the record. Exclusive creation at mode 600 avoids both.
+  if [[ -d $UNIT_DIR/prefix-proxy.settings ]]; then
+    echo "ERROR: $UNIT_DIR/prefix-proxy.settings is a directory; remove it and re-run ./install.sh" >&2
+    exit 2
+  fi
+  settings_tmp=$(umask 077 && mktemp "$UNIT_DIR/.prefix-proxy.settings.XXXXXX")
+  printf 'CAPTURE_DIR=%s\nPROXY_PORT=%s\n' "$CAPTURE_DIR" "$PROXY_PORT" >"$settings_tmp"
+  chmod 600 "$settings_tmp"
+  # -T so the destination is a name to replace, never a directory to move into:
+  # the check above cannot cover a directory created between it and this line,
+  # and without -T that race publishes no record and hides the temporary file
+  # inside it. Failing here is right; the exit trap removes the temporary file.
+  mv -fT -- "$settings_tmp" "$UNIT_DIR/prefix-proxy.settings"
+  settings_tmp=""
 fi
 systemctl --user enable --now cache-warmer.timer
 timer_paused=0

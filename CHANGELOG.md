@@ -1,5 +1,35 @@
 # Changelog
 
+## Unreleased — GPT Pro review follow-up (bq-2472, bq-2473)
+
+- **A healthy proxy took a route it did not own.** The ownership marker
+  protected the failed-health branch only, so a shell that had deliberately
+  selected another provider kept it when the check failed and lost it when the
+  check succeeded — silently, to a proxy that forwards requests and their
+  authentication headers upstream. The guard now selects the capture proxy only
+  when nothing else has selected a route; anything that survives the withdrawal
+  of the guard's own route is left alone, a route equal to the proxy URL that
+  carries no marker of its own is left in place rather than claimed — whichever
+  marker it was sitting beside — and standing aside is stated once on stderr.
+  Neither notice interpolates a URL, so neither can print a credential carried
+  in one.
+- **Installed settings stopped at the installer.** `install.sh` resolved
+  `CAPTURE_DIR` and `PROXY_PORT` from config with `CW_*` overrides and verified
+  a running proxy against them, while `shell-guard.sh` — the next step in the
+  documented path — read only exported `CW_*` values or hard-coded defaults. A
+  custom directory or port therefore installed cleanly and left the next shell
+  unrouted and uncaptured. The installer now publishes the values it verified
+  to `~/.config/systemd/user/prefix-proxy.settings` (mode 600, written only
+  after the nonce check passes, withdrawn by a failed verification, an
+  uninstall or a v2 install, and left untouched by `--defer-restart` so it
+  keeps describing the proxy that is actually running). The guard reads that
+  record line by line and re-validates every field rather than sourcing it, and
+  an explicit `CW_*` in the shell still wins. The record is opened only when it
+  is a regular file — this guard runs from `~/.bashrc`, and a FIFO left at that
+  path would hang every new shell — and it is published by exclusive creation
+  and rename, so a pathname already occupied by a file or a symlink is never
+  written through.
+
 ## Unreleased — review follow-up (bq-1994–1998)
 
 - **Bypass opt-out missed a supported spelling.** The v2 discovery path now
