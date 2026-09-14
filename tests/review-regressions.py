@@ -357,12 +357,35 @@ fi''')
         self.assertFalse(record.is_symlink())
         self.assertEqual(oct(record.stat().st_mode & 0o777), '0o600')
         self.assertEqual(sorted(p.name for p in units.glob('.prefix-proxy.settings*')), [])
-        # A directory there is an error, not a place to quietly move the new file into.
+        # A directory there is an error, not a place to quietly move the new file into —
+        # including one that appears after the check, which only the rename can refuse.
         record.unlink()
         record.mkdir()
         self.config('PRUNE_HOURS=3\n')
         self.assertNotEqual(self.install().returncode, 0)
         self.assertEqual(list(record.iterdir()), [])
+        record.rmdir()
+        real_mv = shutil.which('mv')
+        self.fake('mv', f'mkdir -p "${{*: -1}}"; exec {real_mv} "$@"')
+        self.assertNotEqual(self.install().returncode, 0)
+        self.assertEqual(list(record.iterdir()), [])
+        self.fake('mv', f'exec {real_mv} "$@"')
+
+    def test_bq_2473_publication_cleans_up_only_what_it_created(self):
+        """bq-2473 review fold: the exit trap never removes a pathname it was handed"""
+        # v2 needs its own dependency present, or it would exit before the trap exists
+        # and the case would pass without ever reaching the code under test.
+        self.fake('tmux', 'exit 0')
+        decoy = self.home / 'decoy'
+        self.config()
+        self.assertEqual(self.install().returncode, 0)
+        for args, env in (('', dict(FAIL_RELOAD='1')), ('--defer-restart', {}),
+                          ('--engine v2 --force-v2', {})):
+            with self.subTest(install=args or 'v3'):
+                decoy.write_text('decoy')
+                self.config('PRUNE_HOURS=4\n')
+                self.install(args, settings_tmp=str(decoy), **env)
+                self.assertTrue(decoy.exists(), 'an inherited settings_tmp was deleted')
 
     def test_bq_1996_config_cannot_overwrite_installer_state(self):
         """bq-1996: config assignments beyond the shared settings stay in the config's own scope"""

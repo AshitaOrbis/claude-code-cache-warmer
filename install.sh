@@ -186,10 +186,16 @@ bash_bin=$(command -v bash)
 # here until scheduling is restored, any unsuccessful exit says the timer is
 # still stopped instead of leaving that to be discovered.
 timer_paused=0
+# Both of these are read by the EXIT trap below, so both are set BEFORE it is
+# installed: an inherited environment variable of the same name would otherwise
+# be treated as a temporary file this run created, and deleted on the way out.
+settings_tmp=""
 report_paused_timer() {
   local status=$?
   # A settings record half-published below leaves its temporary file behind.
-  [[ -z ${settings_tmp:-} ]] || rm -f "$settings_tmp"
+  # Only ever the path mktemp handed THIS run: the variable starts empty and is
+  # cleared again the moment the record is published.
+  [[ -z $settings_tmp ]] || rm -f "$settings_tmp"
   if ((status != 0 && timer_paused)); then
     echo "NOTE: this install stopped cache-warmer.timer and it is still stopped." >&2
     echo "      Fix the error above, then re-run ./install.sh to verify the proxy and restore it." >&2
@@ -288,7 +294,11 @@ if [[ $ENGINE == v3 ]]; then
   settings_tmp=$(umask 077 && mktemp "$UNIT_DIR/.prefix-proxy.settings.XXXXXX")
   printf 'CAPTURE_DIR=%s\nPROXY_PORT=%s\n' "$CAPTURE_DIR" "$PROXY_PORT" >"$settings_tmp"
   chmod 600 "$settings_tmp"
-  mv -f "$settings_tmp" "$UNIT_DIR/prefix-proxy.settings"
+  # -T so the destination is a name to replace, never a directory to move into:
+  # the check above cannot cover a directory created between it and this line,
+  # and without -T that race publishes no record and hides the temporary file
+  # inside it. Failing here is right; the exit trap removes the temporary file.
+  mv -fT -- "$settings_tmp" "$UNIT_DIR/prefix-proxy.settings"
   settings_tmp=""
 fi
 systemctl --user enable --now cache-warmer.timer
