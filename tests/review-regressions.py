@@ -36,6 +36,7 @@ class Review(unittest.TestCase):
         self.fake('claude', 'echo 2.1.200')
         self.fake('systemctl', '''echo "$*" >> "$CALLS"
 if [[ $* == *daemon-reload* && ${FAIL_RELOAD:-0} == 1 ]]; then echo "mock reload failure" >&2; exit 1; fi
+if [[ $* == *'enable prefix-proxy.service'* && ${FAIL_ENABLE:-0} == 1 ]]; then echo "mock enable failure" >&2; exit 1; fi
 if [[ $* == *is-active* ]]; then [[ -f "$HOME/active" ]]; exit; fi
 if [[ $* == *'restart prefix-proxy.service'* || $* == *'enable --now prefix-proxy.service'* ]]; then
   mkdir -p "$NONCE_DIR"; echo nonce > "$NONCE_DIR/.health-nonce"; touch "$HOME/active"
@@ -224,6 +225,34 @@ fi''')
                 config.write_text(f'ENABLED=0\nMIN_CACHE_READ_PCT={value}\n')
                 r = self.run_shell('bash replay-warmer.sh --dry-run', CW_CONFIG=str(config))
                 self.assertEqual('MIN_CACHE_READ_PCT must be between 80 and 100' in r.stderr, refused, r.stderr)
+
+    def test_bq_1997_interrupted_update_leaves_no_fingerprint_to_trust(self):
+        """bq-1997: a failure after the new unit is written cannot let a rollback skip the restart"""
+        calls = self.base / 'calls'
+        self.config()
+        self.assertEqual(self.install().returncode, 0)
+        self.config('PRUNE_HOURS=2\n')
+        # The new unit is written and reloaded, then enabling fails. systemd could now
+        # restart the proxy from that unit on its own (Restart=always).
+        self.assertNotEqual(self.install(FAIL_ENABLE='1').returncode, 0)
+        self.config()
+        calls.write_text('')
+        self.assertEqual(self.install().returncode, 0)
+        self.assertIn('restart prefix-proxy.service', calls.read_text())
+
+    def test_bq_1996_overrides_replace_unusable_config_values(self):
+        """bq-1996: an explicit override replaces an empty or multi-line config value before validation"""
+        units = self.home / '.config/systemd/user'
+        self.config('PROXY_PORT=""\n')
+        r = self.install(CW_PROXY_PORT='8377')
+        self.assertEqual(r.returncode, 0, r.stderr)
+        override = str(self.home / 'override')
+        self.config('CAPTURE_DIR="/tmp/first\nsecond"\n')
+        r = self.install(CW_CAPTURE_DIR=override, NONCE_DIR=override)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn(override, (units / 'prefix-proxy.service').read_text())
+        self.config('PROXY_PORT=""\n')
+        self.assertEqual(self.install().returncode, 2)
 
 
 if __name__ == '__main__':

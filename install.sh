@@ -135,16 +135,22 @@ read_shared_settings() {
     PROXY_PORT=8377
     # shellcheck disable=SC1091
     source "$REPO_DIR/config" >/dev/null || exit 1
-    printf '%s\n' "$ENABLED" "$CAPTURE_DIR" "$PRUNE_HOURS" "$PROXY_PORT"
+    printf '%s\0' "$ENABLED" "$CAPTURE_DIR" "$PRUNE_HOURS" "$PROXY_PORT"
   )
 }
-settings=$(read_shared_settings) || {
+# NUL-separated through a file: command substitution would drop NULs and strip
+# trailing newlines, losing an empty value or splitting one that spans lines
+# before an explicit override had the chance to replace it.
+settings_file=$(mktemp)
+if ! read_shared_settings >"$settings_file"; then
+  rm -f "$settings_file"
   echo "ERROR: could not read the shared settings from $REPO_DIR/config" >&2
   exit 2
-}
-mapfile -t shared <<<"$settings"
+fi
+mapfile -d '' -t shared <"$settings_file"
+rm -f "$settings_file"
 if ((${#shared[@]} != 4)); then
-  echo "ERROR: $REPO_DIR/config: a shared setting is empty or spans lines" >&2
+  echo "ERROR: could not read the shared settings from $REPO_DIR/config" >&2
   exit 2
 fi
 ENABLED=${shared[0]}
@@ -193,6 +199,17 @@ if systemctl --user is-active --quiet cache-warmer.timer; then
 fi
 
 if [[ $ENGINE == v3 ]]; then
+  # prefix-proxy.applied names the code and settings the RUNNING proxy was
+  # verified to have. It is withdrawn here, before any unit file changes, and
+  # written back only after verification below. Anything that stops this run in
+  # between (a failed reload or enable, an interrupt, a deferral) therefore
+  # leaves no fingerprint, and the next install restarts and verifies the proxy
+  # rather than trusting a match with what it last verified, which a proxy
+  # restarted by systemd from the new unit would no longer be running.
+  applied=""
+  [[ ! -f $UNIT_DIR/prefix-proxy.applied ]] || applied=$(<"$UNIT_DIR/prefix-proxy.applied")
+  rm -f "$UNIT_DIR/prefix-proxy.applied"
+
   # One capture directory, created here and named explicitly in BOTH units.
   # The two halves defaulting independently is its own finding (bq-318).
   mkdir -p "$CAPTURE_DIR"
@@ -211,20 +228,12 @@ render_timer >"$UNIT_DIR/cache-warmer.timer"
 
 systemctl --user daemon-reload
 if [[ $ENGINE == v3 ]]; then
-  # prefix-proxy.applied names the code and settings the RUNNING proxy was
-  # verified to have. It is withdrawn before anything that can change what runs
-  # (a restart, a start, or unit files a later restart would pick up) and
-  # rewritten only after verification, so a failed or deferred update can never
-  # be certified later by an older fingerprint that happens to match again.
   fingerprint=$(cat "$UNIT_DIR/prefix-proxy.service" "$REPO_DIR/prefix-proxy.js" | sha256sum)
-  applied=""
-  [[ ! -f $UNIT_DIR/prefix-proxy.applied ]] || applied=$(<"$UNIT_DIR/prefix-proxy.applied")
   if systemctl --user is-active --quiet prefix-proxy.service; then
     # Active is not enabled: a proxy started by hand would not come back at the
     # next login, while the timer enabled below would.
     systemctl --user enable prefix-proxy.service
     if [[ $fingerprint != "$applied" ]]; then
-      rm -f "$UNIT_DIR/prefix-proxy.applied"
       if ((DEFER_RESTART)); then
         timer_paused=0 # the message says so
         echo "restart required: proxy updates staged; cache-warmer.timer stopped. Re-run ./install.sh when in-flight requests can be interrupted."
@@ -233,7 +242,6 @@ if [[ $ENGINE == v3 ]]; then
       systemctl --user restart prefix-proxy.service
     fi
   else
-    rm -f "$UNIT_DIR/prefix-proxy.applied"
     systemctl --user enable --now prefix-proxy.service
   fi
   verified=0
