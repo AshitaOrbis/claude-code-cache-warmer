@@ -11,6 +11,18 @@
   of the guard's own route is left alone, an unmarked route equal to the proxy
   URL is left in place rather than claimed, and standing aside is stated once on
   stderr without repeating a URL that could carry credentials.
+- **Installed settings stopped at the installer.** `install.sh` resolved
+  `CAPTURE_DIR` and `PROXY_PORT` from config with `CW_*` overrides and verified
+  a running proxy against them, while `shell-guard.sh` — the next step in the
+  documented path — read only exported `CW_*` values or hard-coded defaults. A
+  custom directory or port therefore installed cleanly and left the next shell
+  unrouted and uncaptured. The installer now publishes the values it verified
+  to `~/.config/systemd/user/prefix-proxy.settings` (mode 600, written only
+  after the nonce check passes, withdrawn by a failed verification, an
+  uninstall or a v2 install, and left untouched by `--defer-restart` so it
+  keeps describing the proxy that is actually running). The guard reads that
+  record line by line and re-validates every field rather than sourcing it, and
+  an explicit `CW_*` in the shell still wins.
 
 ## Unreleased — review follow-up (bq-1994–1998)
 

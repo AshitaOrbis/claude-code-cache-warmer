@@ -43,7 +43,8 @@ while (($#)); do
       systemctl --user disable --now cache-warmer.timer 2>/dev/null || true
       systemctl --user disable --now prefix-proxy.service 2>/dev/null || true
       rm -f "$UNIT_DIR/cache-warmer.service" "$UNIT_DIR/cache-warmer.timer" \
-        "$UNIT_DIR/prefix-proxy.service" "$UNIT_DIR/prefix-proxy.applied"
+        "$UNIT_DIR/prefix-proxy.service" "$UNIT_DIR/prefix-proxy.applied" \
+        "$UNIT_DIR/prefix-proxy.settings"
       systemctl --user daemon-reload 2>/dev/null ||
         echo "WARNING: user systemd daemon-reload failed (units removed anyway)"
       echo "cache-warmer units removed."
@@ -220,6 +221,9 @@ if [[ $ENGINE == v3 ]]; then
   render_warmer_service "$bash_bin" "$REPO_DIR/replay-warmer.sh" "$unit_path" v3 "$CAPTURE_DIR" "$PRUNE_HOURS" \
     >"$UNIT_DIR/cache-warmer.service"
 else
+  # v2 forks sessions; there is no capture proxy for the shell guard to route
+  # to, so any settings a previous v3 install published stop being true here.
+  rm -f "$UNIT_DIR/prefix-proxy.settings"
   render_warmer_service "$bash_bin" "$REPO_DIR/cache-warmer.sh" "$unit_path" v2 \
     >"$UNIT_DIR/cache-warmer.service"
 fi
@@ -257,10 +261,23 @@ if [[ $ENGINE == v3 ]]; then
   done
   if ((verified == 0)); then
     timer_paused=0 # the message says so
+    # The proxy we just started did not answer for these settings, so the
+    # settings on file describe nothing that was verified. Withdraw them rather
+    # than leave the shell guard routing at a proxy we could not confirm.
+    rm -f "$UNIT_DIR/prefix-proxy.settings"
     echo "ERROR: proxy nonce verification failed; cache-warmer.timer remains stopped; re-run ./install.sh" >&2
     exit 1
   fi
   printf '%s\n' "$fingerprint" > "$UNIT_DIR/prefix-proxy.applied"
+  # The third consumer of these settings is the shell guard, and it is the one
+  # that used to resolve them independently (bq-2473). Publish the values this
+  # proxy was just verified against, so a fresh shell routes to the same place.
+  # Only HERE: a staged --defer-restart leaves the previously verified proxy
+  # running and its record untouched, and a failed verification withdraws it —
+  # what is published has always been checked against a live nonce.
+  settings_tmp="$UNIT_DIR/.prefix-proxy.settings.$$"
+  (umask 077 && printf 'CAPTURE_DIR=%s\nPROXY_PORT=%s\n' "$CAPTURE_DIR" "$PROXY_PORT" >"$settings_tmp")
+  mv -f "$settings_tmp" "$UNIT_DIR/prefix-proxy.settings"
 fi
 systemctl --user enable --now cache-warmer.timer
 timer_paused=0

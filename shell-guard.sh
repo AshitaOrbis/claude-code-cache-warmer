@@ -46,8 +46,38 @@ cache_warmer_proxy_answers() {
 }
 
 cache_warmer_guard() {
-  local port="${CW_PROXY_PORT:-8377}"
-  local dir="${CW_CAPTURE_DIR:-$HOME/.cache/prefix-proxy}"
+  # Where install.sh publishes the capture directory and port it VERIFIED a
+  # running proxy against (bq-2473). Without it this guard resolved its own
+  # defaults, so the documented install-then-source-guard path lost every
+  # custom setting between its two entry points: installation confirmed the
+  # right proxy and the next shell routed to a different one, or to nothing.
+  local record="$HOME/.config/systemd/user/prefix-proxy.settings"
+  local installed_dir="" installed_port="" line key value
+  # Read, never sourced. This runs in the user's interactive shell, where
+  # sourcing a settings file would hand it that shell, and every value is
+  # re-validated here: a record left behind by an older install, or edited by
+  # hand, must not be able to point the route somewhere unverified.
+  if [ -r "$record" ]; then
+    while IFS= read -r line || [ -n "$line" ]; do
+      key=${line%%=*}
+      value=${line#*=}
+      [ "$key" != "$line" ] || continue
+      case $key in
+        CAPTURE_DIR) case $value in /*) installed_dir=$value ;; esac ;;
+        PROXY_PORT)
+          case $value in
+            '' | *[!0-9]*) ;;
+            *) [ "$value" -ge 1 ] && [ "$value" -le 65535 ] && installed_port=$value ;;
+          esac
+          ;;
+      esac
+    done <"$record"
+  fi
+
+  # An explicit CW_* in this shell is still the override of record; the
+  # installer's verified settings come next; the built-in defaults last.
+  local port="${CW_PROXY_PORT:-${installed_port:-8377}}"
+  local dir="${CW_CAPTURE_DIR:-${installed_dir:-$HOME/.cache/prefix-proxy}}"
   local endpoint="http://127.0.0.1:${port}" unmarked=0 healthy=0
 
   # Withdraw our own route before checking again. Ownership needs the marker: a

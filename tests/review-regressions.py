@@ -195,6 +195,85 @@ fi''')
                 self.assertEqual(r.stdout.splitlines(),
                                  ['http://127.0.0.1:8377', 'http://127.0.0.1:8377'], r.stderr)
 
+    def test_bq_2473_the_guard_follows_the_verified_installed_settings(self):
+        """bq-2473: a fresh shell routes to the directory and port the installer verified"""
+        record = self.home / '.config/systemd/user/prefix-proxy.settings'
+        report = 'source shell-guard.sh; echo "${ANTHROPIC_BASE_URL-unset}"'
+        # The documented path: configure, install, then source the guard in a NEW shell that
+        # carries no CW_* at all. Installation verifying the right proxy while the next entry
+        # point resolves different settings is the whole finding.
+        custom = self.home / 'custom-captures'
+        self.config(f'CAPTURE_DIR="{custom}"\n')
+        self.assertEqual(self.install(NONCE_DIR=str(custom)).returncode, 0)
+        r = self.run_shell(report)
+        self.assertEqual(r.stdout.strip(), 'http://127.0.0.1:8377', r.stderr)
+        self.assertEqual(record.read_text(), f'CAPTURE_DIR={custom}\nPROXY_PORT=8377\n')
+        self.assertEqual(oct(record.stat().st_mode & 0o777), '0o600')
+        # An explicit CW_* in the shell still overrides the record, and still fails closed.
+        r = self.run_shell(report, CW_CAPTURE_DIR=str(self.home / 'elsewhere'))
+        self.assertEqual(r.stdout.strip(), 'unset', r.stderr)
+        # A custom port, proved against a probe that answers on that port only.
+        self.fake('curl', 'case "$*" in *127.0.0.1:9310/warmer-health*) echo nonce ;; *) exit 7 ;; esac')
+        self.config('PROXY_PORT=9310\n')
+        self.assertEqual(self.install().returncode, 0)
+        r = self.run_shell(report)
+        self.assertEqual(r.stdout.strip(), 'http://127.0.0.1:9310', r.stderr)
+        # Settings that exist only in the installer's invocation reach the guard too.
+        override = self.home / 'invocation-only'
+        self.fake('curl', 'echo nonce')
+        self.config()
+        self.assertEqual(self.install(CW_CAPTURE_DIR=str(override), NONCE_DIR=str(override)).returncode, 0)
+        r = self.run_shell(report)
+        self.assertEqual(r.stdout.strip(), 'http://127.0.0.1:8377', r.stderr)
+        self.assertIn(f'CAPTURE_DIR={override}', record.read_text())
+        # A value the guard cannot trust is never used: each unusable field falls back
+        # to its built-in default instead of reaching the endpoint or the nonce path.
+        # A relative directory therefore looks in the default store (no nonce, no
+        # route); a bad port leaves the default port, never 'http://127.0.0.1:nine'.
+        for bad, expected in ((f'CAPTURE_DIR=relative\nPROXY_PORT=8377\n', 'unset'),
+                              (f'CAPTURE_DIR={override}\nPROXY_PORT=nine\n', 'http://127.0.0.1:8377'),
+                              (f'CAPTURE_DIR={override}\nPROXY_PORT=70000\n', 'http://127.0.0.1:8377'),
+                              (f'CAPTURE_DIR={override}\nPROXY_PORT=0\n', 'http://127.0.0.1:8377'),
+                              (f'PROXY_PORT=8377\n', 'unset'),
+                              (f'junk\nCAPTURE_DIR={override}\nUNKNOWN=x\n', 'http://127.0.0.1:8377')):
+            with self.subTest(record=bad):
+                record.write_text(bad)
+                r = self.run_shell(report)
+                self.assertEqual(r.stdout.strip(), expected, r.stderr)
+
+    def test_bq_2473_only_verified_settings_are_published(self):
+        """bq-2473: staged, unverified and engineless installs publish no settings"""
+        record = self.home / '.config/systemd/user/prefix-proxy.settings'
+        report = 'source shell-guard.sh; echo "${ANTHROPIC_BASE_URL-unset}"'
+        running = self.home / 'running-captures'
+        self.config(f'CAPTURE_DIR="{running}"\n')
+        self.assertEqual(self.install(NONCE_DIR=str(running)).returncode, 0)
+        self.assertEqual(self.run_shell(report).stdout.strip(), 'http://127.0.0.1:8377')
+        applied = record.read_text()
+        # --defer-restart stages a new port and leaves the old proxy running. The record has
+        # to keep describing the proxy that is actually up, not the one that is staged.
+        self.config(f'CAPTURE_DIR="{running}"\nPROXY_PORT=9310\n')
+        self.assertIn('restart required', self.install('--defer-restart').stdout)
+        self.assertEqual(record.read_text(), applied)
+        self.assertEqual(self.run_shell(report).stdout.strip(), 'http://127.0.0.1:8377')
+        # A restart whose nonce check fails publishes nothing and withdraws what it had.
+        staged = self.home / 'staged-captures'
+        self.config(f'CAPTURE_DIR="{staged}"\n')
+        self.assertNotEqual(self.install(BAD_HEALTH='1', NONCE_DIR=str(staged)).returncode, 0)
+        self.assertFalse(record.exists())
+        self.assertEqual(self.run_shell(report).stdout.strip(), 'unset')
+        # v2 has no capture proxy, and an uninstall leaves none either.
+        self.fake('tmux', 'exit 0')
+        self.config()
+        self.assertEqual(self.install().returncode, 0)
+        self.assertTrue(record.exists())
+        self.assertEqual(self.install('--engine v2 --force-v2').returncode, 0)
+        self.assertFalse(record.exists())
+        self.assertEqual(self.install().returncode, 0)
+        self.assertTrue(record.exists())
+        self.assertEqual(self.install('--uninstall').returncode, 0)
+        self.assertFalse(record.exists())
+
     def test_bq_1996_config_cannot_overwrite_installer_state(self):
         """bq-1996: config assignments beyond the shared settings stay in the config's own scope"""
         self.config(f'ENGINE=v2\nUNIT_DIR="{self.home}/alternate-units"\nDEFER_RESTART=1\nREPO_DIR=/nonexistent\n')

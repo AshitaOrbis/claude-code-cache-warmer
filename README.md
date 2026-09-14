@@ -168,6 +168,18 @@ local provider on that port) is also left in place, and is never claimed by this
 guard; if the proxy is down that case gets its own notice, since the guard
 cannot withdraw a route it did not export.
 
+The guard resolves *where* to look the way the installer resolved it. An
+explicit `CW_CAPTURE_DIR` / `CW_PROXY_PORT` in the shell wins; otherwise it
+follows the settings `install.sh` publishes to
+`~/.config/systemd/user/prefix-proxy.settings` once it has verified a live
+proxy against them; otherwise the built-in defaults. That record is read line
+by line and re-validated — never sourced into your shell — and it is written
+only after a nonce check passes, so `--defer-restart` leaves the running
+proxy's settings in place, a failed verification withdraws them, and both
+`--uninstall` and a v2 install remove them. Without it, installing a custom
+capture directory or port and then sourcing the guard in a fresh shell left
+that shell unrouted and uncaptured.
+
 A replay is recorded as `WARMED` only when cached reads cover at least
 `MIN_CACHE_READ_PCT` (default 80%) of total input: cache reads + cache creation
 + uncached input. `PARTIAL` or ambiguous usage never advances `last_warm`.
