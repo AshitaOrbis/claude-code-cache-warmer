@@ -20,8 +20,9 @@
 - **Reinstallation left the old proxy running.** Changed code or settings
   trigger a controlled restart with the timer paused, followed by nonce
   verification against the effective capture directory. The applied fingerprint
-  is withdrawn before anything that changes what runs and rewritten only after
-  verification, so a failed update cannot be certified by a later rollback.
+  is withdrawn before any unit file changes and rewritten only after
+  verification, so no failed or interrupted update can be certified by a later
+  rollback.
   An already-active proxy is enabled too. `--defer-restart` stages changes and
   reports that a restart is required; any other failure after the timer was
   paused says the timer is still stopped.
