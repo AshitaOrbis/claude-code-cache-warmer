@@ -8,9 +8,11 @@
   check succeeded — silently, to a proxy that forwards requests and their
   authentication headers upstream. The guard now selects the capture proxy only
   when nothing else has selected a route; anything that survives the withdrawal
-  of the guard's own route is left alone, an unmarked route equal to the proxy
-  URL is left in place rather than claimed, and standing aside is stated once on
-  stderr without repeating a URL that could carry credentials.
+  of the guard's own route is left alone, a route equal to the proxy URL that
+  carries no marker of its own is left in place rather than claimed — whichever
+  marker it was sitting beside — and standing aside is stated once on stderr.
+  Neither notice interpolates a URL, so neither can print a credential carried
+  in one.
 - **Installed settings stopped at the installer.** `install.sh` resolved
   `CAPTURE_DIR` and `PROXY_PORT` from config with `CW_*` overrides and verified
   a running proxy against them, while `shell-guard.sh` — the next step in the
@@ -22,7 +24,11 @@
   uninstall or a v2 install, and left untouched by `--defer-restart` so it
   keeps describing the proxy that is actually running). The guard reads that
   record line by line and re-validates every field rather than sourcing it, and
-  an explicit `CW_*` in the shell still wins.
+  an explicit `CW_*` in the shell still wins. The record is opened only when it
+  is a regular file — this guard runs from `~/.bashrc`, and a FIFO left at that
+  path would hang every new shell — and it is published by exclusive creation
+  and rename, so a pathname already occupied by a file or a symlink is never
+  written through.
 
 ## Unreleased — review follow-up (bq-1994–1998)
 

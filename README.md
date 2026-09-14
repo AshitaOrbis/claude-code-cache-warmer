@@ -163,10 +163,11 @@ healthy**: the guard selects the capture proxy only when nothing else has
 selected a route, and a shell that already points at another provider keeps it
 and gets a one-line notice on stderr saying it will not be captured (the notice
 never repeats the URL — a base URL can carry credentials). One that equals the
-proxy URL but carries no marker (a shell that ran an older guard, or a different
-local provider on that port) is also left in place, and is never claimed by this
+proxy URL but carries no marker of its own (a shell that ran an older guard, a
+different local provider on that port, or a route replaced by hand beside a
+marker from another port) is also left in place, and is never claimed by this
 guard; if the proxy is down that case gets its own notice, since the guard
-cannot withdraw a route it did not export.
+cannot withdraw a route it did not export. Neither notice repeats a URL.
 
 The guard resolves *where* to look the way the installer resolved it. An
 explicit `CW_CAPTURE_DIR` / `CW_PROXY_PORT` in the shell wins; otherwise it

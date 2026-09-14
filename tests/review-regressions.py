@@ -1,5 +1,6 @@
-"""Offline bq-1994 through bq-1998 regressions; all writes stay in fixtures."""
+"""Offline bq-1994 through bq-2473 regressions; all writes stay in fixtures."""
 import json
+import os
 from pathlib import Path
 import shutil
 import subprocess
@@ -273,6 +274,95 @@ fi''')
         self.assertTrue(record.exists())
         self.assertEqual(self.install('--uninstall').returncode, 0)
         self.assertFalse(record.exists())
+
+    def test_bq_2472_a_notice_describes_the_case_it_is_printed_for(self):
+        """bq-2472 review fold: a matching route beside a marker for another port is still unclaimed"""
+        directory = self.home / 'captures'
+        directory.mkdir()
+        (directory / '.health-nonce').write_text('nonce')
+        report = 'source shell-guard.sh; echo "${ANTHROPIC_BASE_URL-unset}"; echo "${CW_GUARD_ENDPOINT-unset}"'
+        # A route replaced by hand beside a marker left on another port: what survives the
+        # withdrawal IS the proxy URL, so the shell is captured and must not be told otherwise.
+        env = dict(CW_CAPTURE_DIR=str(directory), ANTHROPIC_BASE_URL='http://127.0.0.1:8377',
+                   CW_GUARD_ENDPOINT='http://127.0.0.1:9999')
+        self.fake('curl', 'echo nonce')
+        r = self.run_shell(report, **env)
+        self.assertEqual(r.stdout.splitlines(), ['http://127.0.0.1:8377', 'unset'], r.stderr)
+        self.assertNotIn('will not be captured', r.stderr)
+        # Down, the same state is the documented unmarked-matching-route case and says so.
+        self.fake('curl', 'exit 1')
+        r = self.run_shell(report, **env)
+        self.assertEqual(r.stdout.splitlines(), ['http://127.0.0.1:8377', 'unset'], r.stderr)
+        self.assertIn('was not set by this guard', r.stderr)
+        # Neither notice interpolates a URL, so neither can print one that carries a
+        # credential — including through a malformed port override that lands in the endpoint.
+        self.assertNotIn('http://127.0.0.1', r.stderr)
+        r = self.run_shell(report, CW_CAPTURE_DIR=str(directory),
+                           CW_PROXY_PORT='fixture-password@example.test',
+                           ANTHROPIC_BASE_URL='http://127.0.0.1:fixture-password@example.test')
+        self.assertNotIn('fixture-password', r.stderr)
+
+    def test_bq_2473_an_unusable_record_falls_back_to_the_default_store(self):
+        """bq-2473 review fold: a record the guard cannot trust never reaches the nonce path"""
+        default = self.home / '.cache/prefix-proxy'
+        default.mkdir(parents=True)
+        (default / '.health-nonce').write_text('nonce')
+        units = self.home / '.config/systemd/user'
+        units.mkdir(parents=True)
+        record = units / 'prefix-proxy.settings'
+        report = 'source shell-guard.sh; echo "${ANTHROPIC_BASE_URL-unset}"'
+        self.fake('curl', 'echo nonce')
+        elsewhere = self.home / 'elsewhere'
+        # install.sh refuses a CR in CAPTURE_DIR, so a CRLF record is not one it wrote; the
+        # carriage return must not travel into the nonce path instead of falling back here.
+        record.write_bytes(f'CAPTURE_DIR={elsewhere}\r\nPROXY_PORT=8377\r\n'.encode())
+        r = self.run_shell(report)
+        self.assertEqual(r.stdout.strip(), 'http://127.0.0.1:8377', r.stderr)
+        # A port too long to be one, and a zero-prefixed one, fall back without the shell
+        # arithmetic complaining on the user's terminal.
+        for port in ('9' * 40, '08377'):
+            with self.subTest(port=port):
+                record.write_text(f'CAPTURE_DIR={default}\nPROXY_PORT={port}\n')
+                r = self.run_shell(report)
+                self.assertEqual(r.stdout.strip(), 'http://127.0.0.1:8377', r.stderr)
+                self.assertEqual(r.stderr, '')
+        # This guard is sourced from ~/.bashrc: anything at that path that is not a regular
+        # file must not be opened, or a FIFO with no writer hangs every new shell.
+        record.unlink()
+        os.mkfifo(record)
+        try:
+            r = subprocess.run(['bash', '-c', report], cwd=self.repo, env=self.env,
+                               text=True, capture_output=True, timeout=20)
+        except subprocess.TimeoutExpired:
+            self.fail('the guard blocked on a settings record that is not a regular file')
+        self.assertEqual(r.stdout.strip(), 'http://127.0.0.1:8377', r.stderr)
+
+    def test_bq_2473_the_record_is_published_as_a_fresh_private_regular_file(self):
+        """bq-2473 review fold: publication does not reuse or follow what it finds at its paths"""
+        units = self.home / '.config/systemd/user'
+        record = units / 'prefix-proxy.settings'
+        self.config()
+        self.assertEqual(self.install().returncode, 0)
+        self.assertTrue(record.is_file() and not record.is_symlink())
+        self.assertEqual(oct(record.stat().st_mode & 0o777), '0o600')
+        self.assertEqual(sorted(p.name for p in units.glob('.prefix-proxy.settings*')), [])
+        # A symlink at the published path is replaced by the record; its target is untouched.
+        victim = self.home / 'victim'
+        victim.write_text('victim')
+        record.unlink()
+        record.symlink_to(victim)
+        self.config('PRUNE_HOURS=2\n')
+        self.assertEqual(self.install().returncode, 0)
+        self.assertEqual(victim.read_text(), 'victim')
+        self.assertFalse(record.is_symlink())
+        self.assertEqual(oct(record.stat().st_mode & 0o777), '0o600')
+        self.assertEqual(sorted(p.name for p in units.glob('.prefix-proxy.settings*')), [])
+        # A directory there is an error, not a place to quietly move the new file into.
+        record.unlink()
+        record.mkdir()
+        self.config('PRUNE_HOURS=3\n')
+        self.assertNotEqual(self.install().returncode, 0)
+        self.assertEqual(list(record.iterdir()), [])
 
     def test_bq_1996_config_cannot_overwrite_installer_state(self):
         """bq-1996: config assignments beyond the shared settings stay in the config's own scope"""

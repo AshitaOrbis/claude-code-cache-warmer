@@ -188,6 +188,8 @@ bash_bin=$(command -v bash)
 timer_paused=0
 report_paused_timer() {
   local status=$?
+  # A settings record half-published below leaves its temporary file behind.
+  [[ -z ${settings_tmp:-} ]] || rm -f "$settings_tmp"
   if ((status != 0 && timer_paused)); then
     echo "NOTE: this install stopped cache-warmer.timer and it is still stopped." >&2
     echo "      Fix the error above, then re-run ./install.sh to verify the proxy and restore it." >&2
@@ -275,9 +277,19 @@ if [[ $ENGINE == v3 ]]; then
   # Only HERE: a staged --defer-restart leaves the previously verified proxy
   # running and its record untouched, and a failed verification withdraws it —
   # what is published has always been checked against a live nonce.
-  settings_tmp="$UNIT_DIR/.prefix-proxy.settings.$$"
-  (umask 077 && printf 'CAPTURE_DIR=%s\nPROXY_PORT=%s\n' "$CAPTURE_DIR" "$PROXY_PORT" >"$settings_tmp")
+  # mktemp, not a name built from $$: a pathname that already exists would be
+  # truncated rather than created, keeping whatever mode it had, and a symlink
+  # left there would be followed — writing through it and then publishing the
+  # link itself as the record. Exclusive creation at mode 600 avoids both.
+  if [[ -d $UNIT_DIR/prefix-proxy.settings ]]; then
+    echo "ERROR: $UNIT_DIR/prefix-proxy.settings is a directory; remove it and re-run ./install.sh" >&2
+    exit 2
+  fi
+  settings_tmp=$(umask 077 && mktemp "$UNIT_DIR/.prefix-proxy.settings.XXXXXX")
+  printf 'CAPTURE_DIR=%s\nPROXY_PORT=%s\n' "$CAPTURE_DIR" "$PROXY_PORT" >"$settings_tmp"
+  chmod 600 "$settings_tmp"
   mv -f "$settings_tmp" "$UNIT_DIR/prefix-proxy.settings"
+  settings_tmp=""
 fi
 systemctl --user enable --now cache-warmer.timer
 timer_paused=0
