@@ -108,6 +108,10 @@ for _n in ENABLED WARM_MIN_AGE WARM_MAX_AGE RATELIMIT_MIN MISMATCH_COOLDOWN_DAYS
   _o="CW_$_n"
   [[ -n ${!_o:-} ]] && declare "$_n=${!_o}"
   [[ ${!_n} =~ ^[0-9]+$ ]] || { echo "config error: $_n must be an integer (got '${!_n}')" >&2; exit 2; }
+  # Decimal, always. Bash arithmetic reads a leading zero as octal while jq's
+  # --argjson reads the same text as decimal, so MIN_CACHE_READ_PCT=0120 passed
+  # the range check below as 80 and then failed every receipt as 120.
+  declare "$_n=$((10#${!_n}))"
 done
 (( MIN_CACHE_READ_PCT >= 80 && MIN_CACHE_READ_PCT <= 100 )) \
   || { echo "config error: MIN_CACHE_READ_PCT must be between 80 and 100" >&2; exit 2; }
@@ -385,14 +389,8 @@ for sid in "${!NEWEST_FILE[@]}"; do
 
   # Missing/malformed counters are -1, never an optimistic zero. Limit values
   # to JSON's exact-integer range so the Bash ratio arithmetic cannot overflow.
-  usage_tsv=$(jq -r '
-      def counter:
-        if type == "number" and . >= 0 and . == floor and . <= 9007199254740991
-        then tostring else "-1" end;
-      [(if has("cache_read") then (.cache_read | counter) else "-1" end),
-       (if has("cache_creation") then (.cache_creation | counter) else "-1" end),
-       (if has("input_tokens") then (.input_tokens | counter) else "-1" end)]
-      | @tsv' <<<"$result" 2>/dev/null) || usage_tsv=$'-1\t-1\t-1'
+  usage_tsv=$(jq -L "$SCRIPT_DIR/lib" -r 'include "receipt"; usage_counters | @tsv' \
+    <<<"$result" 2>/dev/null) || usage_tsv=$'-1\t-1\t-1'
   IFS=$'\t' read -r c_read c_create input_tokens <<<"$usage_tsv"
   total_input=$((c_read + c_create + input_tokens))
   coverage_pct=0
@@ -401,8 +399,8 @@ for sid in "${!NEWEST_FILE[@]}"; do
   # Match v2's verified-full-hit rule: cached tokens must cover at least 80% of
   # ALL input (read + creation + uncached). A one-token read beside a huge cold
   # input is PARTIAL and must never advance freshness (bq-1256/1319/1390).
-  if (( c_read > 0 && c_create >= 0 && input_tokens >= 0 && total_input > 0 \
-        && c_read * 100 >= MIN_CACHE_READ_PCT * total_input )); then
+  if jq -L "$SCRIPT_DIR/lib" -e --argjson threshold "$MIN_CACHE_READ_PCT" \
+    'include "receipt"; full_hit($threshold)' <<<"$result" >/dev/null; then
     printf '%s' "$(date +%s)" > "$STATE_DIR/${sid}.last_warm"
     rm -f "$STATE_DIR/${sid}.mismatch_count"
     log "RESULT sid=${sid:0:8} WARMED coverage=${coverage_pct}% cache_read=$c_read cache_creation=$c_create input_tokens=$input_tokens out=$(jq -r '.output_tokens // "aborted"' <<<"$result") cap=$(jq -r '.cap // "none"' <<<"$result") (replay)"

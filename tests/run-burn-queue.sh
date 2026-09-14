@@ -209,6 +209,8 @@ stage_warmer() {
   local stage=$1 result=${2:-'{"http":200,"cache_read":900,"cache_creation":0,"input_tokens":100,"output_tokens":1,"cap":1}'}
   mkdir -p "$stage"
   cp "$REPO_DIR/replay-warmer.sh" "$stage/replay-warmer.sh"
+  mkdir -p "$stage/lib"
+  cp "$REPO_DIR/lib/receipt.jq" "$stage/lib/"
   sed "s|RESULT_JSON|$result|" >"$stage/warm-replay.py" <<'PY'
 #!/usr/bin/env python3
 import pathlib
@@ -243,6 +245,8 @@ H="$WORK/retry-home"; CAP="$H/.cache/prefix-proxy"; STAGE="$WORK/retry-stage"
 make_capture "$CAP" req-1000-000-msg 33333333-3333-3333-3333-333333333333 50
 printf 'ENABLED=1\n' >"$WORK/retry-config"
 mkdir -p "$STAGE"; cp "$REPO_DIR/replay-warmer.sh" "$STAGE/replay-warmer.sh"
+mkdir -p "$STAGE/lib"
+cp "$REPO_DIR/lib/receipt.jq" "$STAGE/lib/"
 cat >"$STAGE/warm-replay.py" <<'PY'
 #!/usr/bin/env python3
 import pathlib
@@ -450,6 +454,8 @@ print('yes' if mod.is_keepalive_transcript(path) else 'no')
 PY
 )
 assert_eq "marker after byte 4096 excludes the fork transcript" yes "$ttl_probe"
+
+python3 "$TESTS_DIR/review-regressions.py"
 
 printf '\n----------------------------------------\n'
 printf 'burn-queue: Passed: %d   Failed: %d\n' "$PASS" "$FAIL"

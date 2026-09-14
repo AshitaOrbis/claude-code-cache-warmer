@@ -17,9 +17,9 @@
 #
 #   CW_LIVE=1 tests/live-replay-gate.sh ~/.cache/prefix-proxy/req-…-msg.json
 #
-# PASS = cache_read is at least 20x cache_creation and output_tokens is at or
-# below the cap. FAIL = capping perturbs the cache key; revert to abort-only
-# (CW_REPLAY_ABORT=1 with the cap disabled) and re-open bq-315.
+# PASS requires >=80% cached input and a measured, non-aborted completion
+# within a positive integer cap. FAIL includes inconclusive receipts; it does
+# not by itself prove that capping perturbed the cache key.
 #
 # Second, separate gate, NOT automated here: Anthropic's billing behaviour for
 # a client disconnect mid-stream. The abort path bounds wall-clock and bytes on
@@ -45,17 +45,12 @@ echo "replaying $(basename "$CAPTURE") against the LIVE API…"
 result=$(python3 "$REPO_DIR/warm-replay.py" "$CAPTURE" "$HDRS")
 echo "$result"
 
-read -r http c_read c_create out cap < <(
-  jq -r '[.http, .cache_read, .cache_creation, (.output_tokens // 0), (.cap // 0)] | @tsv' <<<"$result"
-)
-
-fail=0
-(( http == 200 )) || { echo "FAIL: http=$http"; fail=1; }
-(( c_read > 0 && c_create * 20 < c_read )) \
-  || { echo "FAIL: capping perturbed the cache key (read=$c_read create=$c_create)"; fail=1; }
-(( cap == 0 || out <= cap )) || { echo "FAIL: output_tokens=$out exceeded cap=$cap"; fail=1; }
-
-if (( fail == 0 )); then
-  echo "PASS: capped replay still reads the full prefix (read=$c_read create=$c_create out=$out cap=$cap)"
+# The production full-hit threshold is 80% of read + creation + uncached input.
+# Aborted receipts can establish cache evidence, but cannot pass this cap gate.
+if jq -L "$REPO_DIR/lib" -e 'include "receipt"; full_hit(80) and capped_completion' \
+  <<<"$result" >/dev/null; then
+  echo "PASS: capped replay still reads the full prefix (coverage >= 80%, measured output within positive cap)"
+else
+  echo "FAIL: partial or inconclusive cache/capped-completion evidence"
+  exit 1
 fi
-exit "$fail"
