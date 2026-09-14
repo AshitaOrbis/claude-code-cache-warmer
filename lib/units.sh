@@ -2,7 +2,7 @@
 # Unit-file rendering + version gating for install.sh.
 #
 # Extracted from install.sh so it can be TESTED. install.sh itself installs
-# systemd units and must never run inside a test suite, but the decisions it
+# systemd units and runs in tests only inside a fully mocked fixture. Decisions it
 # makes — which engine is even legal on this Claude Code version, what the
 # generated units say, how a path with spaces is escaped — are exactly the
 # parts worth guarding (bq-313). Sourcing this file has no side effects.
@@ -83,11 +83,11 @@ WantedBy=default.target
 UNIT
 }
 
-# render_warmer_service <bash-bin> <script> <unit-path> [engine] [capture-dir]
+# render_warmer_service <bash-bin> <script> <unit-path> [engine] [capture-dir] [prune-hours]
 # The capture dir is baked into the v3 unit so the warmer and the proxy can
 # never resolve different stores (bq-318).
 render_warmer_service() {
-  local bash_bin=$1 script=$2 unit_path=$3 engine=${4:-v3} capdir=${5:-}
+  local bash_bin=$1 script=$2 unit_path=$3 engine=${4:-v3} capdir=${5:-} prune=${6:-6}
   local desc="Claude Code prompt-cache warmer (v3 replay)"
   [[ $engine == v2 ]] && desc="Claude Code prompt-cache warmer (v2 fork-based keepalive)"
   # Built before the heredoc, not inside a ${var:+...} expansion: the quotes are
@@ -97,6 +97,7 @@ render_warmer_service() {
   env_lines+=$'\n'"Environment=\"PATH=$(systemd_quote "$unit_path")\""
   if [[ -n $capdir ]]; then
     env_lines+=$'\n'"Environment=\"CW_CAPTURE_DIR=$(systemd_quote "$capdir")\""
+    env_lines+=$'\n'"Environment=\"CW_PRUNE_HOURS=$prune\""
   fi
   cat <<UNIT
 [Unit]

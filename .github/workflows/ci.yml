@@ -56,7 +56,7 @@ jobs:
       - name: py_compile
         run: |
           python3 -m py_compile lib/jsonl.py measure-ttl.py \
-            warm-replay.py tests/fake_anthropic.py
+            warm-replay.py tests/fake_anthropic.py tests/review-regressions.py
 
       # Core-logic test suite (parsing, classification, submit detection).
       # Never forks a live Claude session — pure fixture-driven logic.

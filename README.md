@@ -99,11 +99,20 @@ Requires `node` (≥ 18), `python3`, `jq`, and `claude` on PATH.
 ```bash
 git clone https://github.com/AshitaOrbis/claude-code-cache-warmer
 cd claude-code-cache-warmer
-./install.sh        # v3: active proxy + 10-min warmer timer; warming starts disabled
+./install.sh        # v3: active proxy + 10-min warmer timer; new configs start disabled
 ```
 
 That installs **two** systemd user units, both pointed at one shared capture
-directory (`CW_CAPTURE_DIR`, default `~/.cache/prefix-proxy`):
+directory (`CAPTURE_DIR` in config, overridden by `CW_CAPTURE_DIR`; default
+`~/.cache/prefix-proxy`). Retention uses `PRUNE_HOURS` with `CW_PRUNE_HOURS`
+precedence in both units. Existing `ENABLED` is preserved. Reinstalling restarts
+an active proxy when its code or settings changed, interrupting in-flight requests,
+and verifies its capture-directory nonce before starting the timer. An older
+installation without an applied fingerprint gets one restart to establish it. Use
+`./install.sh --defer-restart` to stage changes with the timer stopped; it reports
+"restart required" until a later ordinary install applies and verifies them.
+
+Installed units:
 
 | Unit | What it does |
 |---|---|
@@ -144,8 +153,10 @@ source /path/to/claude-code-cache-warmer/shell-guard.sh
 
 `shell-guard.sh` exports `ANTHROPIC_BASE_URL` only when the nonce file is
 non-empty AND the proxy echoes that exact value — so a proxy that is down, a
-missing nonce, a relocated `CW_CAPTURE_DIR`, or a squatter on the port all leave
-your sessions talking to api.anthropic.com directly: unwarmable, but working.
+missing nonce, a relocated `CW_CAPTURE_DIR`, or a squatter on the port clears
+a previously guard-managed route, including one inherited from a parent shell.
+The exported `CW_GUARD_ENDPOINT` marker tracks that route across port changes.
+Unrelated intentional provider URLs are left untouched on failed checks.
 
 A replay is recorded as `WARMED` only when cached reads cover at least
 `MIN_CACHE_READ_PCT` (default 80%) of total input: cache reads + cache creation

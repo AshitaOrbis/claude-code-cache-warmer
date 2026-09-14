@@ -28,7 +28,8 @@ RATELIMIT_MIN=30
 # retried (mismatch causes like a binary update or CLAUDE.md edit are transient).
 MISMATCH_COOLDOWN_DAYS=3
 
-# Warm sessions launched with --dangerously-skip-permissions? The fork is a
+# Warm sessions launched with --dangerously-skip-permissions or permission-mode
+# bypassPermissions (including the equals spelling)? The fork is a
 # fully-armed agent in the live cwd; in bypass mode it could act on the
 # keepalive with no approval gate (see README "Armed forks"). Set 0 to skip
 # bypass-permission sessions entirely. Default 1 — the keepalive instructs the
@@ -67,7 +68,9 @@ FORK_RETENTION_DAYS=7
 
 # Where prefix-proxy.js writes captures and replay-warmer.sh reads them.
 # ONE setting for both halves — install.sh passes it to the proxy unit and
-# exports it to the warmer unit as CW_CAPTURE_DIR. If they ever disagree,
+# exports it to the warmer unit as CW_CAPTURE_DIR. CW_CAPTURE_DIR overrides
+# config during installation; CW_PRUNE_HOURS likewise overrides PRUNE_HOURS
+# for both units. Re-run install.sh after changing shared settings. If they disagree,
 # both report success and nothing is ever warmed.
 CAPTURE_DIR="$HOME/.cache/prefix-proxy"
 

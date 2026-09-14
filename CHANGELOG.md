@@ -1,5 +1,26 @@
 # Changelog
 
+## Unreleased — review follow-up (bq-1994–1998)
+
+- **Bypass opt-out missed a supported spelling.** The v2 discovery path now
+  classifies the same validated options it passes to the fork, including both
+  `--permission-mode bypassPermissions` forms. The opt-out runs before spawning.
+- **The live gate certified unmeasured completions.** Gate and production share
+  the full-hit rule: at least 80% of total input must be cached reads. The cap
+  gate also requires measured integer output within a positive integer cap and
+  no abort. Disconnect billing remains a separate manual measurement.
+- **Installation ignored existing capture policy.** Config supplies the shared
+  directory and retention, explicit CW_* overrides win, and both units receive
+  the effective values. Invalid settings fail; preserved ENABLED is reported.
+- **Reinstallation left the old proxy running.** Changed code or settings now
+  trigger a controlled restart with the timer stopped, followed by nonce
+  verification against the effective capture directory. `--defer-restart`
+  stages changes and reports restart required. Unchanged installs avoid restart.
+- **Failed guards retained inherited dead routes.** The guard clears its managed
+  endpoint on failure, tracks it across port changes, and preserves unrelated
+  provider URLs. Offline regressions cover all five findings, including installer
+  fixtures with copied repos, temporary HOME and mocked systemctl/curl/tools.
+
 ## Unreleased — v3 hardening (GPT-5.6-Pro review, 2026-08-12)
 
 Eight findings against the v3 replay engine. The engine had **no tests at all**

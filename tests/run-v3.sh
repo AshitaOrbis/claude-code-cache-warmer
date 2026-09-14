@@ -7,7 +7,7 @@
 # Everything here is hermetic: a temp HOME, a temp capture store, a stub
 # warm-replay.py that records its invocations instead of calling Anthropic, and
 # a local fake SSE server for the real warm-replay.py. No network, no API
-# credentials, no systemd, and install.sh is never executed.
+# credentials, no systemd, and installer integration uses only copied repos and mocked tools.
 #
 #   tests/run-v3.sh
 set -euo pipefail
@@ -306,6 +306,8 @@ PYSTUB
 STAGE="$WORK/stage-refuse"
 mkdir -p "$STAGE"
 cp "$REPO_DIR/replay-warmer.sh" "$STAGE/"
+mkdir -p "$STAGE/lib"
+cp "$REPO_DIR/lib/receipt.jq" "$STAGE/lib/"
 cp "$BIN/warm-replay.py" "$STAGE/"
 printf 'ENABLED=1\n' > "$WORK/config-refuse"
 mkdir -p "$H/.cache/cache-warmer-v3"
@@ -410,6 +412,8 @@ make_capture "$CAP" "req-warmable-001-msg" "$SID" 50
 STAGE="$WORK/stage-dry"
 mkdir -p "$STAGE"
 cp "$REPO_DIR/replay-warmer.sh" "$STAGE/"
+mkdir -p "$STAGE/lib"
+cp "$REPO_DIR/lib/receipt.jq" "$STAGE/lib/"
 stub_warm_replay "$STAGE" '{"http":200,"cache_read":71410,"cache_creation":0,"output_tokens":1}'
 printf 'ENABLED=1\n' > "$WORK/config-dry"
 mkdir -p "$H/.cache/cache-warmer-v3"
@@ -448,6 +452,8 @@ make_capture "$CAP" "req-stale-001-msg" bbbbbbbb-1111-2222-3333-444444444444 600
 STAGE="$WORK/stage-regex"
 mkdir -p "$STAGE"
 cp "$REPO_DIR/replay-warmer.sh" "$STAGE/"
+mkdir -p "$STAGE/lib"
+cp "$REPO_DIR/lib/receipt.jq" "$STAGE/lib/"
 stub_warm_replay "$STAGE" '{"http":200,"cache_read":71410,"cache_creation":0,"output_tokens":1}'
 printf 'ENABLED=1\n' > "$WORK/config-regex"
 
@@ -490,6 +496,8 @@ age_capture "$CAP" "req-edge-000-msg" $(( 58 * 60 - 3 ))
 STAGE="$WORK/stage-clock"
 mkdir -p "$STAGE"
 cp "$REPO_DIR/replay-warmer.sh" "$STAGE/"
+mkdir -p "$STAGE/lib"
+cp "$REPO_DIR/lib/receipt.jq" "$STAGE/lib/"
 stub_warm_replay "$STAGE" '{"http":200,"cache_read":71410,"cache_creation":0,"output_tokens":1}'
 printf 'ENABLED=1\n' > "$WORK/config-clock"
 HOME="$H" CW_CONFIG="$WORK/config-clock" CW_JITTER_SECONDS=6 bash "$STAGE/replay-warmer.sh"
@@ -508,6 +516,8 @@ make_capture "$CAP" "req-mid-000-msg" "$SID" 50
 STAGE="$WORK/stage-stamp"
 mkdir -p "$STAGE"
 cp "$REPO_DIR/replay-warmer.sh" "$STAGE/"
+mkdir -p "$STAGE/lib"
+cp "$REPO_DIR/lib/receipt.jq" "$STAGE/lib/"
 stub_warm_replay "$STAGE" '{"http":200,"cache_read":71410,"cache_creation":0,"output_tokens":1}'
 started=$(date +%s)
 HOME="$H" CW_CONFIG="$WORK/config-clock" CW_JITTER_SECONDS=4 bash "$STAGE/replay-warmer.sh"
@@ -556,6 +566,8 @@ make_capture "$CAP" "req-oneshot-000-msg" "$ONE" 50 "$(body_with_msgs "$ONE" "$O
 STAGE="$WORK/stage-minmsgs"
 mkdir -p "$STAGE"
 cp "$REPO_DIR/replay-warmer.sh" "$STAGE/"
+mkdir -p "$STAGE/lib"
+cp "$REPO_DIR/lib/receipt.jq" "$STAGE/lib/"
 stub_warm_replay "$STAGE" '{"http":200,"cache_read":71410,"cache_creation":0,"output_tokens":1}'
 printf 'ENABLED=1\n' > "$WORK/config-minmsgs"
 assert_eq "the capture really does have 5 API messages (the old count)" "5" \
@@ -589,6 +601,8 @@ make_capture "$CAP2" "req-mixed-000-msg" "$MIX" 50 "$(body_with_msgs "$MIX" "$MI
 STAGE2="$WORK/stage-mixed"
 mkdir -p "$STAGE2"
 cp "$REPO_DIR/replay-warmer.sh" "$STAGE2/"
+mkdir -p "$STAGE2/lib"
+cp "$REPO_DIR/lib/receipt.jq" "$STAGE2/lib/"
 stub_warm_replay "$STAGE2" '{"http":200,"cache_read":71410,"cache_creation":0,"output_tokens":1}'
 HOME="$H2" CW_CONFIG="$WORK/config-minmsgs" bash "$STAGE2/replay-warmer.sh"
 assert_eq "2 human turns fail MIN_MSGS=3" "no" \
@@ -688,6 +702,8 @@ make_capture "$CAP" "req-fail-000-msg" "$SID" 50
 STAGE="$WORK/stage-rollback"
 mkdir -p "$STAGE"
 cp "$REPO_DIR/replay-warmer.sh" "$STAGE/"
+mkdir -p "$STAGE/lib"
+cp "$REPO_DIR/lib/receipt.jq" "$STAGE/lib/"
 # A 401-style transient failure: nonzero exit, but NOT the exit-3 permanent
 # refusal. It never recovers, so one process must stop after three total calls.
 cat > "$STAGE/warm-replay.py" <<'PYSTUB'
@@ -726,6 +742,8 @@ make_capture "$CAP" "req-good-001-msg" bdbdbdbd-1111-2222-3333-444444444444 50
 STAGE="$WORK/stage-malformed"
 mkdir -p "$STAGE"
 cp "$REPO_DIR/replay-warmer.sh" "$STAGE/"
+mkdir -p "$STAGE/lib"
+cp "$REPO_DIR/lib/receipt.jq" "$STAGE/lib/"
 stub_warm_replay "$STAGE" '{"http":200,"cache_read":71410,"cache_creation":0,"output_tokens":1}'
 assert_status "the run completes rather than dying under set -e" 0 \
   env HOME="$H" CW_CONFIG="$WORK/config-clock" bash "$STAGE/replay-warmer.sh"
@@ -756,6 +774,8 @@ make_capture "$CAP" "req-realarray-001-msg" cecececd-1111-2222-3333-444444444444
 STAGE="$WORK/stage-jqobj"
 mkdir -p "$STAGE"
 cp "$REPO_DIR/replay-warmer.sh" "$STAGE/"
+mkdir -p "$STAGE/lib"
+cp "$REPO_DIR/lib/receipt.jq" "$STAGE/lib/"
 stub_warm_replay "$STAGE" '{"http":200,"cache_read":71410,"cache_creation":0,"output_tokens":1}'
 HOME="$H" CW_CONFIG="$WORK/config-clock" bash "$STAGE/replay-warmer.sh"
 assert_eq "an OBJECT of user-shaped values is NOT warmed" "no" \

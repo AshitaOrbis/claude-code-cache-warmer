@@ -386,7 +386,21 @@ record_authoritative_process() {
   args=$(argv_to_shell_words "$@")
   flags=$(replicated_flags "$@")
   prefix_unreplicable "$@" && unreplicable=1
-  argv_has_exact --dangerously-skip-permissions "$@" && bypass=1
+  # Classification consumes the same validated, normalized options as the fork.
+  local -a fork_options=()
+  local i
+  read -r -a fork_options <<< "$flags"
+  for ((i = 0; i < ${#fork_options[@]}; i++)); do
+    case ${fork_options[$i]} in
+      --dangerously-skip-permissions) bypass=1 ;;
+      --permission-mode|--model)
+        if [[ ${fork_options[$i]} == --permission-mode && ${fork_options[$((i + 1))]:-} == bypassPermissions ]]; then
+          bypass=1
+        fi
+        i=$((i + 1))
+        ;;
+    esac
+  done
   [[ -z ${RESUME_SID_AMBIGUOUS[$sid]:-} ]] || return 1
   if [[ -n ${RESUME_SID_ARGS[$sid]+x} ]]; then
     if [[ ${RESUME_SID_CWD[$sid]} != "$cwd" || ${RESUME_SID_ARGS[$sid]} != "$args" \

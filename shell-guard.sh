@@ -21,13 +21,19 @@
 # the port, and a healthy proxy.
 #
 # Fail-closed by construction: the nonce must be non-empty AND the proxy must
-# echo that exact value. Anything else leaves ANTHROPIC_BASE_URL alone and the
-# session talks to api.anthropic.com directly — unwarmable, but working.
+# echo that exact value. Failed checks clear inherited guard-managed routes;
+# unrelated provider URLs are preserved.
 
 cache_warmer_guard() {
   local port="${CW_PROXY_PORT:-8377}"
   local dir="${CW_CAPTURE_DIR:-$HOME/.cache/prefix-proxy}"
-  local nonce live
+  local nonce live endpoint="http://127.0.0.1:${port}"
+
+  # Clear our previous route before checking, including across port changes.
+  if [[ ${ANTHROPIC_BASE_URL:-} == "${CW_GUARD_ENDPOINT:-$endpoint}" ]]; then
+    unset ANTHROPIC_BASE_URL
+  fi
+  unset CW_GUARD_ENDPOINT
 
   nonce=$(cat "$dir/.health-nonce" 2>/dev/null) || return 0
   # An empty nonce can never authenticate anything. This single test is the
@@ -38,7 +44,8 @@ cache_warmer_guard() {
   [ -n "$live" ] || return 0
   [ "$live" = "$nonce" ] || return 0
 
-  export ANTHROPIC_BASE_URL="http://127.0.0.1:${port}"
+  export ANTHROPIC_BASE_URL="$endpoint"
+  export CW_GUARD_ENDPOINT="$endpoint"
 }
 
 cache_warmer_guard
