@@ -163,6 +163,38 @@ fi''')
         r = self.run_shell('source shell-guard.sh; echo "$ANTHROPIC_BASE_URL"', CW_CAPTURE_DIR=str(directory), ANTHROPIC_BASE_URL='https://intentional.example')
         self.assertEqual(r.stdout.strip(), 'https://intentional.example')
 
+    def test_bq_2472_a_healthy_proxy_keeps_a_route_it_does_not_own(self):
+        """bq-2472: the guard selects the proxy only when nothing else has selected a route"""
+        directory = self.home / 'captures'
+        directory.mkdir()
+        (directory / '.health-nonce').write_text('nonce')
+        self.fake('curl', 'echo nonce')          # the proxy answers, and it matches
+        report = 'source shell-guard.sh; echo "${ANTHROPIC_BASE_URL-unset}"; echo "${CW_GUARD_ENDPOINT-unset}"'
+        env = dict(CW_CAPTURE_DIR=str(directory))
+        # An unrelated provider survived a FAILED health check already (bq-1998). It has to
+        # survive a successful one too: the healthy branch is where the traffic moves.
+        r = self.run_shell(report, ANTHROPIC_BASE_URL='https://intentional.example', **env)
+        self.assertEqual(r.stdout.splitlines(), ['https://intentional.example', 'unset'], r.stderr)
+        self.assertIn('did not set', r.stderr)
+        self.assertNotIn('intentional.example', r.stderr)   # never echo a route that may carry credentials
+        # A route replaced by hand beside a marker from an earlier guard is the same case.
+        r = self.run_shell(report, ANTHROPIC_BASE_URL='https://intentional.example',
+                           CW_GUARD_ENDPOINT='http://127.0.0.1:8377', **env)
+        self.assertEqual(r.stdout.splitlines(), ['https://intentional.example', 'unset'], r.stderr)
+        # An unmarked route that equals the proxy URL is left in place and NOT claimed:
+        # the guard cannot withdraw later what it did not export.
+        r = self.run_shell(report, ANTHROPIC_BASE_URL='http://127.0.0.1:8377', **env)
+        self.assertEqual(r.stdout.splitlines(), ['http://127.0.0.1:8377', 'unset'], r.stderr)
+        # Controls: with no route of its own to preserve the guard still routes, still
+        # replaces its own route on another port, and treats an empty value as no choice.
+        for base in ({}, dict(ANTHROPIC_BASE_URL=''),
+                     dict(ANTHROPIC_BASE_URL='http://127.0.0.1:9999',
+                          CW_GUARD_ENDPOINT='http://127.0.0.1:9999')):
+            with self.subTest(inherited=base):
+                r = self.run_shell(report, **dict(env, **base))
+                self.assertEqual(r.stdout.splitlines(),
+                                 ['http://127.0.0.1:8377', 'http://127.0.0.1:8377'], r.stderr)
+
     def test_bq_1996_config_cannot_overwrite_installer_state(self):
         """bq-1996: config assignments beyond the shared settings stay in the config's own scope"""
         self.config(f'ENGINE=v2\nUNIT_DIR="{self.home}/alternate-units"\nDEFER_RESTART=1\nREPO_DIR=/nonexistent\n')

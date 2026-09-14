@@ -1,5 +1,17 @@
 # Changelog
 
+## Unreleased — GPT Pro review follow-up (bq-2472, bq-2473)
+
+- **A healthy proxy took a route it did not own.** The ownership marker
+  protected the failed-health branch only, so a shell that had deliberately
+  selected another provider kept it when the check failed and lost it when the
+  check succeeded — silently, to a proxy that forwards requests and their
+  authentication headers upstream. The guard now selects the capture proxy only
+  when nothing else has selected a route; anything that survives the withdrawal
+  of the guard's own route is left alone, an unmarked route equal to the proxy
+  URL is left in place rather than claimed, and standing aside is stated once on
+  stderr without repeating a URL that could carry credentials.
+
 ## Unreleased — review follow-up (bq-1994–1998)
 
 - **Bypass opt-out missed a supported spelling.** The v2 discovery path now

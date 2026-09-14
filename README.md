@@ -156,10 +156,17 @@ non-empty AND the proxy echoes that exact value — so a proxy that is down, a
 missing nonce, a relocated `CW_CAPTURE_DIR`, or a squatter on the port withdraws
 a route the guard itself exported, including one inherited from a parent shell
 or left on an old port: the guard exports `CW_GUARD_ENDPOINT` beside the route
-as its ownership marker. Any other `ANTHROPIC_BASE_URL` is left untouched. One
-that equals the proxy URL but carries no marker (a shell that ran an older
-guard, or a different local provider on that port) is also left in place, with
-a one-line notice on stderr.
+as its ownership marker.
+
+Any other `ANTHROPIC_BASE_URL` is left untouched, **including when the proxy is
+healthy**: the guard selects the capture proxy only when nothing else has
+selected a route, and a shell that already points at another provider keeps it
+and gets a one-line notice on stderr saying it will not be captured (the notice
+never repeats the URL — a base URL can carry credentials). One that equals the
+proxy URL but carries no marker (a shell that ran an older guard, or a different
+local provider on that port) is also left in place, and is never claimed by this
+guard; if the proxy is down that case gets its own notice, since the guard
+cannot withdraw a route it did not export.
 
 A replay is recorded as `WARMED` only when cached reads cover at least
 `MIN_CACHE_READ_PCT` (default 80%) of total input: cache reads + cache creation
