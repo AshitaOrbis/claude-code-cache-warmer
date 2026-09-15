@@ -8,10 +8,12 @@
   default directory and port, where that proxy still answered its nonce check,
   even a fresh shell with no inherited route kept routing through it and its
   eligible request bodies kept being captured. The switch now also stops and
-  disables `prefix-proxy.service` and removes its unit and applied marker,
-  fails (with the timer still stopped) if the proxy cannot be stopped, and
-  warns that shells already routed through it keep pointing at the stopped
-  listener.
+  disables `prefix-proxy.service` — when its unit is here, when it is running,
+  and when it is enabled from another user unit directory — removes its unit
+  and applied marker, fails (with the timer still stopped) if the proxy is
+  still running or enabled afterwards, and warns that shells already routed
+  through it keep pointing at the stopped listener: re-sourcing the guard
+  withdraws only a route the guard exported.
 - **The guard promised no capture it could not know about.** When the proxy
   was healthy and the shell already carried an `ANTHROPIC_BASE_URL` the guard
   had not set, the guard kept the route — correctly — and said these sessions

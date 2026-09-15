@@ -189,10 +189,14 @@ that shell unrouted and uncaptured.
 Removing the record is not the same as removing the proxy: a missing record
 means "try the defaults", and a proxy still answering there passes the nonce
 check. So switching an existing v3 install to v2 also stops and disables
-`prefix-proxy.service` and removes its unit, and the install fails — leaving
-the timer stopped — if the proxy cannot be stopped. A shell that was already
-routed through the proxy keeps its `ANTHROPIC_BASE_URL` pointing at the stopped
-listener until the guard is sourced again or the variable is unset.
+`prefix-proxy.service` (whenever its unit is here, it is running, or it is
+enabled from any user unit directory) and removes the unit this installer
+wrote, and the install fails — leaving the timer stopped — if the proxy is
+still running or enabled afterwards. A shell that was already routed through
+the proxy keeps its `ANTHROPIC_BASE_URL` pointing at the stopped listener.
+Sourcing the guard again withdraws a route the guard exported; any other route
+to the listener — set by hand, left by an older guard, or spelled differently —
+stays until it is unset or replaced.
 
 A replay is recorded as `WARMED` only when cached reads cover at least
 `MIN_CACHE_READ_PCT` (default 80%) of total input: cache reads + cache creation

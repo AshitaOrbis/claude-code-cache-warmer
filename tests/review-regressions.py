@@ -411,11 +411,11 @@ start() {
 }
 case $cmd in
   is-active) [[ -f $state/$unit.active ]] ;;
-  is-enabled) [[ -f $state/$unit.enabled ]] ;;
+  is-enabled) if [[ -f $state/$unit.enabled ]]; then echo enabled; else echo disabled; exit 1; fi ;;
   enable) touch "$state/$unit.enabled"; if ((now)); then start; fi ;;
   disable)
     if [[ $unit == prefix-proxy.service && ${FAIL_STOP:-0} == 1 ]]; then echo "mock stop failure" >&2; exit 1; fi
-    rm -f "$state/$unit.enabled"
+    if [[ ${STUCK_ENABLED:-0} != 1 ]]; then rm -f "$state/$unit.enabled"; fi
     if ((now)) && [[ ${STUCK_STOP:-0} != 1 ]]; then rm -f "$state/$unit.active"; fi ;;
   start | restart) start ;;
   stop) rm -f "$state/$unit.active" ;;
@@ -445,11 +445,13 @@ esac''')
         # ...so a fresh shell with no inherited route and no CW_* has nothing to route to,
         r = self.run_shell(report)
         self.assertEqual(r.stdout.strip(), 'unset', r.stderr)
-        # and the shells routed before the switch, which nothing here can reach, are warned about.
+        # and the shells routed before the switch, which nothing here can reach, are warned
+        # about, without promising that re-sourcing the guard repairs a route it never owned.
         self.assertIn('already routed through it', switch.stderr)
-        # A shutdown that fails, or that reports success and leaves the proxy running, is an
-        # error rather than a completed transition.
-        for failure in ('FAIL_STOP', 'STUCK_STOP'):
+        self.assertIn('must be unset or replaced', switch.stderr)
+        # A shutdown that fails, or that reports success and leaves the proxy running or still
+        # enabled, is an error rather than a completed transition.
+        for failure in ('FAIL_STOP', 'STUCK_STOP', 'STUCK_ENABLED'):
             with self.subTest(failure=failure):
                 self.assertEqual(self.install().returncode, 0)
                 self.assertTrue(proxy('active'))
@@ -457,6 +459,15 @@ esac''')
                 self.assertNotEqual(r.returncode, 0, r.stdout)
                 self.assertNotIn('v2 (fork engine) installed', r.stdout)
                 self.assertIn('could not stop and disable prefix-proxy.service', r.stderr)
+        # A proxy enabled from another user unit directory is not running and has no unit here,
+        # yet it starts at the next login and the guard would route to it again.
+        self.assertEqual(self.install().returncode, 0)
+        self.assertEqual(self.install(v2).returncode, 0)
+        (state / 'prefix-proxy.service.enabled').touch()
+        self.assertFalse((units / 'prefix-proxy.service').exists() or proxy('active'))
+        r = self.install(v2)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertFalse(proxy('enabled'), 'a proxy enabled from another unit directory survived the switch to v2')
 
     def test_bq_2559_an_unowned_route_gets_no_capture_assurance(self):
         """bq-2559: a route the guard did not set is kept without a claim about whether it is captured"""
