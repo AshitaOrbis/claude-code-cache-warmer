@@ -41,7 +41,9 @@ if [[ $* == *'enable prefix-proxy.service'* && ${FAIL_ENABLE:-0} == 1 ]]; then e
 if [[ $* == *is-active* ]]; then [[ -f "$HOME/active" ]]; exit; fi
 if [[ $* == *'restart prefix-proxy.service'* || $* == *'enable --now prefix-proxy.service'* ]]; then
   mkdir -p "$NONCE_DIR"; echo nonce > "$NONCE_DIR/.health-nonce"; touch "$HOME/active"
-fi''')
+fi
+# Starting the proxy sets the one marker, so stopping the proxy clears it (bq-2558).
+if [[ $* == *'disable --now prefix-proxy.service'* || $* == *'stop prefix-proxy.service'* ]]; then rm -f "$HOME/active"; fi''')
         self.fake('curl', 'echo probe >> "$CALLS"; [[ ${BAD_HEALTH:-0} == 0 ]] && echo nonce || echo wrong')
 
     def fake(self, name, body):
@@ -386,6 +388,105 @@ fi''')
                 self.config('PRUNE_HOURS=4\n')
                 self.install(args, settings_tmp=str(decoy), **env)
                 self.assertTrue(decoy.exists(), 'an inherited settings_tmp was deleted')
+
+    def test_bq_2558_a_v2_switch_withdraws_the_capture_proxy(self):
+        """bq-2558: switching v3 to v2 stops the capture proxy a fresh shell would otherwise route to"""
+        # One state file per unit. The shared double in setUp keeps a single active marker for
+        # every unit, so it cannot tell a stopped timer from a running proxy — and the proxy's
+        # own lifecycle is what this finding is about.
+        state = self.home / 'unit-state'
+        units = self.home / '.config/systemd/user'
+        self.fake('systemctl', '''echo "$*" >> "$CALLS"
+state=$HOME/unit-state
+mkdir -p "$state"
+args=("$@")
+[[ ${args[0]:-} != --user ]] || args=("${args[@]:1}")
+cmd=${args[0]:-} now=0 unit=
+for a in "${args[@]:1}"; do
+  case $a in --now) now=1 ;; --quiet) ;; *) unit=$a ;; esac
+done
+start() {
+  touch "$state/$unit.active"
+  if [[ $unit == prefix-proxy.service ]]; then mkdir -p "$NONCE_DIR"; echo nonce >"$NONCE_DIR/.health-nonce"; fi
+}
+case $cmd in
+  is-active) [[ -f $state/$unit.active ]] ;;
+  is-enabled) if [[ -f $state/$unit.enabled ]]; then echo enabled; else echo disabled; exit 1; fi ;;
+  enable) touch "$state/$unit.enabled"; if ((now)); then start; fi ;;
+  disable)
+    if [[ $unit == prefix-proxy.service && ${FAIL_STOP:-0} == 1 ]]; then echo "mock stop failure" >&2; exit 1; fi
+    if [[ ${STUCK_ENABLED:-0} != 1 ]]; then rm -f "$state/$unit.enabled"; fi
+    if ((now)) && [[ ${STUCK_STOP:-0} != 1 ]]; then rm -f "$state/$unit.active"; fi ;;
+  start | restart) start ;;
+  stop) rm -f "$state/$unit.active" ;;
+esac''')
+        # The proxy answers its nonce only while it is running, as the real one does.
+        self.fake('curl', '[[ -f $HOME/unit-state/prefix-proxy.service.active ]] || exit 7\necho nonce')
+        self.fake('tmux', 'exit 0')
+        proxy = lambda s: (state / f'prefix-proxy.service.{s}').exists()
+        report = 'source shell-guard.sh; echo "${ANTHROPIC_BASE_URL-unset}"'
+        v2 = '--engine v2 --force-v2'
+        self.config()
+        # A v2 install with no v3 history has no proxy to withdraw, and must not try to.
+        r = self.install(v2)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertNotIn('disable --now prefix-proxy.service', (self.base / 'calls').read_text())
+        # Control: v3 leaves a running, enabled proxy that a fresh shell routes to.
+        self.assertEqual(self.install().returncode, 0)
+        self.assertTrue(proxy('active') and proxy('enabled'))
+        self.assertEqual(self.run_shell(report).stdout.strip(), 'http://127.0.0.1:8377')
+        # The switch withdraws the service, not only the record describing it...
+        switch = self.install(v2)
+        self.assertEqual(switch.returncode, 0, switch.stderr)
+        self.assertFalse(proxy('active'), 'the v3 capture proxy is still running after the switch to v2')
+        self.assertFalse(proxy('enabled'), 'the v3 capture proxy would start again at the next login')
+        for name in ('prefix-proxy.service', 'prefix-proxy.applied', 'prefix-proxy.settings'):
+            self.assertFalse((units / name).exists(), f'{name} survived the switch to v2')
+        # ...so a fresh shell with no inherited route and no CW_* has nothing to route to,
+        r = self.run_shell(report)
+        self.assertEqual(r.stdout.strip(), 'unset', r.stderr)
+        # and the shells routed before the switch, which nothing here can reach, are warned
+        # about, without promising that re-sourcing the guard repairs a route it never owned.
+        self.assertIn('already routed through it', switch.stderr)
+        self.assertIn('must be unset or replaced', switch.stderr)
+        # A shutdown that fails, or that reports success and leaves the proxy running or still
+        # enabled, is an error rather than a completed transition.
+        for failure in ('FAIL_STOP', 'STUCK_STOP', 'STUCK_ENABLED'):
+            with self.subTest(failure=failure):
+                self.assertEqual(self.install().returncode, 0)
+                self.assertTrue(proxy('active'))
+                r = self.install(v2, **{failure: '1'})
+                self.assertNotEqual(r.returncode, 0, r.stdout)
+                self.assertNotIn('v2 (fork engine) installed', r.stdout)
+                self.assertIn('could not stop and disable prefix-proxy.service', r.stderr)
+        # A proxy enabled from another user unit directory is not running and has no unit here,
+        # yet it starts at the next login and the guard would route to it again.
+        self.assertEqual(self.install().returncode, 0)
+        self.assertEqual(self.install(v2).returncode, 0)
+        (state / 'prefix-proxy.service.enabled').touch()
+        self.assertFalse((units / 'prefix-proxy.service').exists() or proxy('active'))
+        r = self.install(v2)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertFalse(proxy('enabled'), 'a proxy enabled from another unit directory survived the switch to v2')
+
+    def test_bq_2559_an_unowned_route_gets_no_capture_assurance(self):
+        """bq-2559: a route the guard did not set is kept without a claim about whether it is captured"""
+        directory = self.home / 'captures'
+        directory.mkdir()
+        (directory / '.health-nonce').write_text('nonce')
+        self.fake('curl', 'echo nonce')          # the proxy answers, and it matches
+        report = 'source shell-guard.sh; echo "${ANTHROPIC_BASE_URL-unset}"; echo "${CW_GUARD_ENDPOINT-unset}"'
+        # A trailing slash is the same proxy: requests through it reach /v1/messages and are
+        # captured. Exact string comparison decides ownership; it cannot decide where another
+        # spelling of a route sends traffic, so no spelling earns a promise of no capture.
+        for route in ('http://127.0.0.1:8377/', 'http://localhost:8377', 'https://intentional.example'):
+            with self.subTest(route=route):
+                r = self.run_shell(report, CW_CAPTURE_DIR=str(directory), ANTHROPIC_BASE_URL=route)
+                self.assertEqual(r.stdout.splitlines(), [route, 'unset'], r.stderr)   # kept, never claimed
+                self.assertNotIn('not be captured', r.stderr)
+                self.assertIn('did not set', r.stderr)
+                self.assertIn('has not established', r.stderr)
+                self.assertNotIn(route.split('//', 1)[1].rstrip('/'), r.stderr)
 
     def test_bq_1996_config_cannot_overwrite_installer_state(self):
         """bq-1996: config assignments beyond the shared settings stay in the config's own scope"""

@@ -229,9 +229,37 @@ if [[ $ENGINE == v3 ]]; then
   render_warmer_service "$bash_bin" "$REPO_DIR/replay-warmer.sh" "$unit_path" v3 "$CAPTURE_DIR" "$PRUNE_HOURS" \
     >"$UNIT_DIR/cache-warmer.service"
 else
-  # v2 forks sessions; there is no capture proxy for the shell guard to route
-  # to, so any settings a previous v3 install published stop being true here.
-  rm -f "$UNIT_DIR/prefix-proxy.settings"
+  # v2 forks sessions and has no capture proxy, so what a previous v3 install
+  # left running has to be withdrawn here, not merely described as gone
+  # (bq-2558). Removing the settings record alone withdrew nothing: a missing
+  # record tells the shell guard to try the default directory and port, a proxy
+  # still running there passes its nonce check, and so even a fresh shell went
+  # on routing through it and having its requests captured.
+  rm -f "$UNIT_DIR/prefix-proxy.settings" "$UNIT_DIR/prefix-proxy.applied"
+  # Enabled counts even when nothing in $UNIT_DIR names the unit: a proxy enabled
+  # from another user unit directory is not running now, but it starts at the
+  # next login and the guard would route to it again.
+  proxy_enabled() {
+    [[ $(systemctl --user is-enabled prefix-proxy.service 2>/dev/null) == enabled* ]]
+  }
+  if [[ -e $UNIT_DIR/prefix-proxy.service ]] || systemctl --user is-active --quiet prefix-proxy.service ||
+    proxy_enabled; then
+    # Stopped and disabled are checked, not assumed: a transition that could not
+    # withdraw the proxy is not a completed one, and the exit trap says the timer
+    # is still stopped.
+    if ! systemctl --user disable --now prefix-proxy.service ||
+      systemctl --user is-active --quiet prefix-proxy.service || proxy_enabled; then
+      echo "ERROR: could not stop and disable prefix-proxy.service, the v3 capture proxy; it may still be capturing the sessions routed through it. Stop it with 'systemctl --user disable --now prefix-proxy.service', then re-run this install." >&2
+      exit 1
+    fi
+    rm -f "$UNIT_DIR/prefix-proxy.service"
+    echo "NOTE: stopped and disabled the v3 capture proxy (prefix-proxy.service)." >&2
+    echo "      A shell that was already routed through it keeps ANTHROPIC_BASE_URL pointing at the stopped" >&2
+    echo "      listener, and Claude Code started there cannot reach the API. Sourcing shell-guard.sh again" >&2
+    echo "      withdraws a route the guard exported; any other route to the listener (set by hand, left by" >&2
+    echo "      an older guard, or spelled differently) must be unset or replaced. A session running through" >&2
+    echo "      it has lost its connection." >&2
+  fi
   render_warmer_service "$bash_bin" "$REPO_DIR/cache-warmer.sh" "$unit_path" v2 \
     >"$UNIT_DIR/cache-warmer.service"
 fi

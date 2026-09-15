@@ -160,9 +160,14 @@ as its ownership marker.
 
 Any other `ANTHROPIC_BASE_URL` is left untouched, **including when the proxy is
 healthy**: the guard selects the capture proxy only when nothing else has
-selected a route, and a shell that already points at another provider keeps it
-and gets a one-line notice on stderr saying it will not be captured (the notice
-never repeats the URL — a base URL can carry credentials). One that equals the
+selected a route, and a shell that already points somewhere else keeps it and
+gets a one-line notice on stderr that the route was left alone and that the
+guard has not established where it sends requests or whether they are captured
+(the notice never repeats the URL — a base URL can carry credentials). It makes
+no promise either way because it could not keep one: the guard compares routes
+as strings to decide *ownership*, and a different spelling of the proxy's own
+address, such as `http://127.0.0.1:8377/` with a trailing slash, still reaches
+the proxy and is captured. One that equals the
 proxy URL but carries no marker of its own (a shell that ran an older guard, a
 different local provider on that port, or a route replaced by hand beside a
 marker from another port) is also left in place, and is never claimed by this
@@ -180,6 +185,18 @@ proxy's settings in place, a failed verification withdraws them, and both
 `--uninstall` and a v2 install remove them. Without it, installing a custom
 capture directory or port and then sourcing the guard in a fresh shell left
 that shell unrouted and uncaptured.
+
+Removing the record is not the same as removing the proxy: a missing record
+means "try the defaults", and a proxy still answering there passes the nonce
+check. So switching an existing v3 install to v2 also stops and disables
+`prefix-proxy.service` (whenever its unit is here, it is running, or it is
+enabled from any user unit directory) and removes the unit this installer
+wrote, and the install fails — leaving the timer stopped — if the proxy is
+still running or enabled afterwards. A shell that was already routed through
+the proxy keeps its `ANTHROPIC_BASE_URL` pointing at the stopped listener.
+Sourcing the guard again withdraws a route the guard exported; any other route
+to the listener — set by hand, left by an older guard, or spelled differently —
+stays until it is unset or replaced.
 
 A replay is recorded as `WARMED` only when cached reads cover at least
 `MIN_CACHE_READ_PCT` (default 80%) of total input: cache reads + cache creation
