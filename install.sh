@@ -229,9 +229,27 @@ if [[ $ENGINE == v3 ]]; then
   render_warmer_service "$bash_bin" "$REPO_DIR/replay-warmer.sh" "$unit_path" v3 "$CAPTURE_DIR" "$PRUNE_HOURS" \
     >"$UNIT_DIR/cache-warmer.service"
 else
-  # v2 forks sessions; there is no capture proxy for the shell guard to route
-  # to, so any settings a previous v3 install published stop being true here.
-  rm -f "$UNIT_DIR/prefix-proxy.settings"
+  # v2 forks sessions and has no capture proxy, so what a previous v3 install
+  # left running has to be withdrawn here, not merely described as gone
+  # (bq-2558). Removing the settings record alone withdrew nothing: a missing
+  # record tells the shell guard to try the default directory and port, a proxy
+  # still running there passes its nonce check, and so even a fresh shell went
+  # on routing through it and having its requests captured.
+  rm -f "$UNIT_DIR/prefix-proxy.settings" "$UNIT_DIR/prefix-proxy.applied"
+  if [[ -e $UNIT_DIR/prefix-proxy.service ]] || systemctl --user is-active --quiet prefix-proxy.service; then
+    # Stopped is checked, not assumed: a transition that could not stop the
+    # proxy is not a completed one, and the exit trap says the timer is stopped.
+    if ! systemctl --user disable --now prefix-proxy.service ||
+      systemctl --user is-active --quiet prefix-proxy.service; then
+      echo "ERROR: could not stop and disable prefix-proxy.service, the v3 capture proxy; it may still be capturing the sessions routed through it. Stop it with 'systemctl --user disable --now prefix-proxy.service', then re-run this install." >&2
+      exit 1
+    fi
+    rm -f "$UNIT_DIR/prefix-proxy.service"
+    echo "NOTE: stopped and disabled the v3 capture proxy (prefix-proxy.service) and removed its unit." >&2
+    echo "      A shell that was already routed through it keeps ANTHROPIC_BASE_URL pointing at the stopped" >&2
+    echo "      listener: Claude Code started there cannot reach the API until shell-guard.sh is sourced" >&2
+    echo "      again or the variable is unset, and a session running through it has lost its connection." >&2
+  fi
   render_warmer_service "$bash_bin" "$REPO_DIR/cache-warmer.sh" "$unit_path" v2 \
     >"$UNIT_DIR/cache-warmer.service"
 fi

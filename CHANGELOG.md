@@ -1,5 +1,18 @@
 # Changelog
 
+## Unreleased — GPT Pro review follow-up (bq-2558, bq-2559)
+
+- **Switching to v2 left the capture proxy running.** A v2 install removed
+  `prefix-proxy.settings` and nothing else, so the v3 proxy stayed active and
+  enabled — and because a missing record tells the shell guard to try the
+  default directory and port, where that proxy still answered its nonce check,
+  even a fresh shell with no inherited route kept routing through it and its
+  eligible request bodies kept being captured. The switch now also stops and
+  disables `prefix-proxy.service` and removes its unit and applied marker,
+  fails (with the timer still stopped) if the proxy cannot be stopped, and
+  warns that shells already routed through it keep pointing at the stopped
+  listener.
+
 ## Unreleased — GPT Pro review follow-up (bq-2472, bq-2473)
 
 - **A healthy proxy took a route it did not own.** The ownership marker

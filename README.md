@@ -181,6 +181,14 @@ proxy's settings in place, a failed verification withdraws them, and both
 capture directory or port and then sourcing the guard in a fresh shell left
 that shell unrouted and uncaptured.
 
+Removing the record is not the same as removing the proxy: a missing record
+means "try the defaults", and a proxy still answering there passes the nonce
+check. So switching an existing v3 install to v2 also stops and disables
+`prefix-proxy.service` and removes its unit, and the install fails — leaving
+the timer stopped — if the proxy cannot be stopped. A shell that was already
+routed through the proxy keeps its `ANTHROPIC_BASE_URL` pointing at the stopped
+listener until the guard is sourced again or the variable is unset.
+
 A replay is recorded as `WARMED` only when cached reads cover at least
 `MIN_CACHE_READ_PCT` (default 80%) of total input: cache reads + cache creation
 + uncached input. `PARTIAL` or ambiguous usage never advances `last_warm`.
