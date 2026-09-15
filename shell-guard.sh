@@ -114,8 +114,12 @@ cache_warmer_guard() {
   # these lines go to a terminal that gets logged.
   if [ -n "${ANTHROPIC_BASE_URL:-}" ]; then
     if [ "$healthy" = 1 ]; then
+      # Kept, and nothing promised about it (bq-2559). The comparison above is a
+      # string test for OWNERSHIP; a route spelled differently can still reach
+      # this proxy — a trailing slash does — so this guard does not know whether
+      # the sessions it leaves alone are captured, and must not say they are not.
       [ "$unmarked" = 1 ] ||
-        echo "cache-warmer guard: the capture proxy answered, but this shell already has an ANTHROPIC_BASE_URL this guard did not set, so it was left alone and these sessions will not be captured; unset it before sourcing the guard to route through the proxy." >&2
+        echo "cache-warmer guard: the capture proxy answered, but this shell already has an ANTHROPIC_BASE_URL this guard did not set, so it was left alone; this guard has not established where that route sends requests or whether they are captured. Unset it before sourcing the guard to route through the proxy." >&2
     elif [ "$unmarked" = 1 ]; then
       echo "cache-warmer guard: the capture proxy did not answer, but this shell's ANTHROPIC_BASE_URL matches this guard's endpoint and was not set by this guard (no CW_GUARD_ENDPOINT), so it was left in place; unset it if it came from an older guard." >&2
     fi

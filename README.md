@@ -160,9 +160,14 @@ as its ownership marker.
 
 Any other `ANTHROPIC_BASE_URL` is left untouched, **including when the proxy is
 healthy**: the guard selects the capture proxy only when nothing else has
-selected a route, and a shell that already points at another provider keeps it
-and gets a one-line notice on stderr saying it will not be captured (the notice
-never repeats the URL — a base URL can carry credentials). One that equals the
+selected a route, and a shell that already points somewhere else keeps it and
+gets a one-line notice on stderr that the route was left alone and that the
+guard has not established where it sends requests or whether they are captured
+(the notice never repeats the URL — a base URL can carry credentials). It makes
+no promise either way because it could not keep one: the guard compares routes
+as strings to decide *ownership*, and a different spelling of the proxy's own
+address, such as `http://127.0.0.1:8377/` with a trailing slash, still reaches
+the proxy and is captured. One that equals the
 proxy URL but carries no marker of its own (a shell that ran an older guard, a
 different local provider on that port, or a route replaced by hand beside a
 marker from another port) is also left in place, and is never claimed by this

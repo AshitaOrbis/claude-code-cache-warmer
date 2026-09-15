@@ -12,6 +12,15 @@
   fails (with the timer still stopped) if the proxy cannot be stopped, and
   warns that shells already routed through it keep pointing at the stopped
   listener.
+- **The guard promised no capture it could not know about.** When the proxy
+  was healthy and the shell already carried an `ANTHROPIC_BASE_URL` the guard
+  had not set, the guard kept the route — correctly — and said these sessions
+  would not be captured. But the ownership test compares strings, and a route
+  such as `http://127.0.0.1:8377/`, differing only by a trailing slash, still
+  reaches the proxy and has its requests captured. The notice now says only
+  that the route was left alone and that the guard has not established where
+  it sends requests or whether they are captured. Ownership is unchanged, and
+  no URL-equivalent route is claimed.
 
 ## Unreleased — GPT Pro review follow-up (bq-2472, bq-2473)
 

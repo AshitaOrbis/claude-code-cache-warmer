@@ -458,6 +458,25 @@ esac''')
                 self.assertNotIn('v2 (fork engine) installed', r.stdout)
                 self.assertIn('could not stop and disable prefix-proxy.service', r.stderr)
 
+    def test_bq_2559_an_unowned_route_gets_no_capture_assurance(self):
+        """bq-2559: a route the guard did not set is kept without a claim about whether it is captured"""
+        directory = self.home / 'captures'
+        directory.mkdir()
+        (directory / '.health-nonce').write_text('nonce')
+        self.fake('curl', 'echo nonce')          # the proxy answers, and it matches
+        report = 'source shell-guard.sh; echo "${ANTHROPIC_BASE_URL-unset}"; echo "${CW_GUARD_ENDPOINT-unset}"'
+        # A trailing slash is the same proxy: requests through it reach /v1/messages and are
+        # captured. Exact string comparison decides ownership; it cannot decide where another
+        # spelling of a route sends traffic, so no spelling earns a promise of no capture.
+        for route in ('http://127.0.0.1:8377/', 'http://localhost:8377', 'https://intentional.example'):
+            with self.subTest(route=route):
+                r = self.run_shell(report, CW_CAPTURE_DIR=str(directory), ANTHROPIC_BASE_URL=route)
+                self.assertEqual(r.stdout.splitlines(), [route, 'unset'], r.stderr)   # kept, never claimed
+                self.assertNotIn('not be captured', r.stderr)
+                self.assertIn('did not set', r.stderr)
+                self.assertIn('has not established', r.stderr)
+                self.assertNotIn(route.split('//', 1)[1].rstrip('/'), r.stderr)
+
     def test_bq_1996_config_cannot_overwrite_installer_state(self):
         """bq-1996: config assignments beyond the shared settings stay in the config's own scope"""
         self.config(f'ENGINE=v2\nUNIT_DIR="{self.home}/alternate-units"\nDEFER_RESTART=1\nREPO_DIR=/nonexistent\n')
