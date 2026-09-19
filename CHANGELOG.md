@@ -15,6 +15,20 @@
   anything else that begins with `-` is a usage error (exit 2) that writes
   nothing. A directory that really does begin with `-` is still reachable as
   `--logdir=-name`, `./-name`, or after a bare `--`.
+- **A start that failed could unseat the proxy that was running.** The health
+  nonce was written before `listen()`. A second `node prefix-proxy.js` against
+  a store already being served — the port busy, or a mistyped argument —
+  replaced the running proxy's `.health-nonce` and then exited, after which the
+  shell guard compared the live proxy's answer with a nonce it had never
+  issued, read it as a squatter, and withdrew the route from every new shell
+  until the proxy was restarted. Fail-closed, but silent: nothing was captured
+  and nothing said why. The nonce is now written only once the port is held,
+  and a failed bind exits 1 and says so instead of throwing. The retention sweep
+  still runs before the bind on purpose, so a proxy that cannot get its port
+  keeps enforcing retention on every restart attempt. Not covered: the nonce
+  belongs to the store, not the port, so a second proxy that *successfully*
+  binds a different port against the same store still replaces it. One store,
+  one proxy.
 
 ## Unreleased — GPT Pro review follow-up (bq-2558, bq-2559)
 

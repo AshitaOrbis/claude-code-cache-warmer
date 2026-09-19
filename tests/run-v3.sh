@@ -892,6 +892,43 @@ else
   describe "sol-2 squatter loopback fixture: SKIPPED by CW_SKIP_LOOPBACK_TESTS=1"
 fi
 
+# The nonce was written BEFORE listen(), so a start that never got the port —
+# busy port, or (before bq-1971) a typo'd flag — still replaced the nonce of
+# the proxy that did hold it, and the REAL shell guard above then withdrew the
+# route from every new shell. Real proxy, real guard, scratch store, free port.
+if [[ ${CW_SKIP_LOOPBACK_TESTS:-0} != 1 ]]; then
+describe "proxy nonce: a start that never gets the port must not unseat the proxy that has it"
+NS="$WORK/nonce-owner"
+mkdir -p "$NS/home"
+NPORT=$(node -e 'const s = require("net").createServer().listen(0, "127.0.0.1", () => { console.log(s.address().port); s.close(); });')
+# Bounded: if the suite dies between here and the kill below, the EXIT trap
+# only removes $WORK and this proxy would otherwise outlive the run.
+HOME="$NS/home" timeout 60 node "$REPO_DIR/prefix-proxy.js" "$NPORT" "$NS/store" > "$NS/first.log" 2>&1 &
+FIRST=$!
+for _ in $(seq 1 100); do grep -q 'listening on' "$NS/first.log" 2>/dev/null && break; sleep 0.05; done
+assert_eq "the guard routes to the running proxy (positive control)" "http://127.0.0.1:$NPORT" \
+  "$(guard "$NPORT" "$NS/store")"
+# `|| echo` on both reads: a bare failing assignment under `set -e` would end
+# the suite with no tally if the first start lost its port to something else
+# between the picker and the bind — the control above already reports that.
+nonce_id() { sha256sum "$NS/store/.health-nonce" 2>/dev/null || echo missing; }
+before=$(nonce_id)
+assert_status "a second start on the same port and store exits 1" 1 \
+  env HOME="$NS/home" timeout 5 node "$REPO_DIR/prefix-proxy.js" "$NPORT" "$NS/store"
+assert_eq "the running proxy's nonce file exists (control for the next line)" "no" \
+  "$([[ $before == missing ]] && echo yes || echo no)"
+assert_eq "and the failed start leaves it alone" "$before" "$(nonce_id)"
+assert_eq "so the guard STILL routes to the running proxy" "http://127.0.0.1:$NPORT" \
+  "$(guard "$NPORT" "$NS/store")"
+second_err=$(HOME="$NS/home" timeout 5 node "$REPO_DIR/prefix-proxy.js" "$NPORT" "$NS/store" 2>&1 >/dev/null || true)
+assert_eq "the failure says why, without a stack trace" "yes" \
+  "$([[ $second_err == *"cannot listen on 127.0.0.1:$NPORT"* && $second_err != *"    at "* ]] && echo yes || echo no)"
+kill "$FIRST" 2>/dev/null || true
+wait "$FIRST" 2>/dev/null || true
+else
+  describe "proxy nonce ownership loopback fixture: SKIPPED by CW_SKIP_LOOPBACK_TESTS=1"
+fi
+
 describe "sol-3 proxy: an upstream stream error must not be an uncaught exception"
 assert_eq "the upstream response has an error handler" "yes" \
   "$(grep -q "pres.on('error'" "$REPO_DIR/prefix-proxy.js" && echo yes || echo no)"

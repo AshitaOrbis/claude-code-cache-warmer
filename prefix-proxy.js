@@ -493,7 +493,6 @@ function main(argv, env) {
     process.exit(1);
   }
   const nonce = crypto.randomBytes(16).toString('hex');
-  fs.writeFileSync(path.join(logdir, '.health-nonce'), nonce, { mode: 0o600 });
   const state = newHealthState();
 
   // Retention runs here, in the always-on component, and is deliberately
@@ -502,7 +501,38 @@ function main(argv, env) {
   sweep();
   setInterval(sweep, PRUNE_INTERVAL_MS);
 
-  createProxyServer(logdir, nonce, state).listen(port, '127.0.0.1', () => {
+  // The nonce file says "the proxy serving this store is THIS process", so a
+  // process that never got a port has no business writing it. It used to be
+  // written before listen(): a second start against a store already being
+  // served — a busy port, or a typo'd argument — replaced the running proxy's
+  // nonce and then died, and from that moment the shell guard saw a squatter
+  // and withdrew the route from every new shell until the real proxy was
+  // restarted.
+  //
+  // What this does NOT cover: the nonce is keyed by STORE, not by port. A
+  // second proxy that successfully binds a DIFFERENT port against the same
+  // store still replaces it, and the first proxy is unseated just the same.
+  // Refusing that start needs the store to record its owner's port — a
+  // change to the contract with shell-guard.sh and install.sh, not to this
+  // ordering. One store, one proxy.
+  // (The retention sweep above stays BEFORE listen on purpose: under
+  // Restart=always a proxy that cannot bind still enforces retention on every
+  // attempt, and bq-314 made retention independent of everything else.)
+  const server = createProxyServer(logdir, nonce, state);
+  const onListenError = (e) => {
+    console.error(`prefix-proxy: cannot listen on 127.0.0.1:${port}: ${e.message} — the health nonce was not rewritten, so a proxy already serving this store keeps its route.`);
+    process.exit(1);
+  };
+  server.once('error', onListenError);
+  server.listen(port, '127.0.0.1', () => {
+    server.removeListener('error', onListenError);
+    try {
+      fs.writeFileSync(path.join(logdir, '.health-nonce'), nonce, { mode: 0o600 });
+    } catch (e) {
+      // Up without a nonce on disk is a proxy the guard can never verify.
+      console.error(`prefix-proxy: cannot write the health nonce in ${logdir}: ${e.message}`);
+      process.exit(1);
+    }
     console.log(`prefix-proxy listening on 127.0.0.1:${port} -> api.anthropic.com, logging to ${logdir}`);
   });
 }
