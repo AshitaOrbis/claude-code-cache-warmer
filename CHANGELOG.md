@@ -1,5 +1,21 @@
 # Changelog
 
+## Unreleased — proxy arguments (bq-1971)
+
+- **The proxy used a flag name as its capture directory.** `prefix-proxy.js`
+  read its two positionals blind: whatever sat in the second slot was the
+  capture store. `node prefix-proxy.js 8377 --logdir` therefore created a
+  directory literally named `--logdir` in the current directory, wrote a health
+  nonce into it and served from it, silently overriding `CW_CAPTURE_DIR`.
+  `--help` ran the whole startup — store created, nonce written, retention
+  sweep — and only then died on a `NaN` port. Arguments are now parsed and
+  validated before the first filesystem call: `[port] [logdir]` still works
+  exactly as the installed unit uses it, `--port N`, `--logdir DIR` and
+  `-h`/`--help` are recognised, the port must be an integer 0-65535, and
+  anything else that begins with `-` is a usage error (exit 2) that writes
+  nothing. A directory that really does begin with `-` is still reachable as
+  `--logdir=-name`, `./-name`, or after a bare `--`.
+
 ## Unreleased — GPT Pro review follow-up (bq-2558, bq-2559)
 
 - **Switching to v2 left the capture proxy running.** A v2 install removed
