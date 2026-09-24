@@ -87,8 +87,10 @@ esac
 declare -A TOOL_BIN
 deps=(python3 jq claude)
 [[ $ENGINE == v3 ]] && deps+=(node) || deps+=(tmux)
-# v3 verifies the running proxy's nonce over HTTP after (re)starting it (bq-1997).
-[[ $ENGINE != v3 ]] || deps+=(curl)
+# v3 verifies the running proxy's nonce over HTTP after (re)starting it (bq-1997),
+# and that the process answering is the unit's own — ss (iproute2) names the
+# owner of the listening socket (bq-1971 review fold).
+[[ $ENGINE != v3 ]] || deps+=(curl ss)
 for dep in "${deps[@]}"; do
   bin=$(command -v "$dep") || {
     echo "ERROR: '$dep' not found in PATH" >&2
@@ -284,12 +286,32 @@ if [[ $ENGINE == v3 ]]; then
   else
     systemctl --user enable --now prefix-proxy.service
   fi
+  # Every pid that ss attributes to a LISTEN socket on 127.0.0.1:<port>, one per
+  # line, or nothing. A socket this user owns is attributed without privilege,
+  # and that is exactly the case that matters: a proxy this user started by
+  # hand. A listener ss cannot attribute (another user's) yields nothing, and
+  # nothing never verifies.
+  listener_pids() {
+    ss -H -ltnp "sport = :$1" 2>/dev/null | grep -F "127.0.0.1:$1 " | grep -o 'pid=[0-9]*' | cut -d= -f2 || true
+  }
   verified=0
+  unit_state="" unit_pid="" serving=""
   # Up to 25 probes, each allowed 1s plus a 0.2s pause (~30s worst case).
   for ((attempt = 0; attempt < 25; attempt++)); do
     nonce=$(cat "$CAPTURE_DIR/.health-nonce" 2>/dev/null) || nonce=""
     live=$(curl -fs --max-time 1 "http://127.0.0.1:$PROXY_PORT/warmer-health" 2>/dev/null) || live=""
-    if [[ -n $nonce && $nonce == "$live" ]]; then
+    # A matching nonce says SOME proxy serving this store answers on this port.
+    # It does not say which process. The nonce is written only once a start has
+    # bound the port, so a start that lost the port to a proxy launched by hand
+    # leaves that proxy's nonce in place, and that proxy keeps answering it
+    # while the unit crash-loops on EADDRINUSE — a comparison of nonce against
+    # answer alone then certified a service that never bound (review of record,
+    # 2026-09-20). The process holding the socket must be the unit's own.
+    unit_state=$(systemctl --user show -p ActiveState --value prefix-proxy.service 2>/dev/null) || unit_state=""
+    unit_pid=$(systemctl --user show -p MainPID --value prefix-proxy.service 2>/dev/null) || unit_pid=""
+    serving=$(listener_pids "$PROXY_PORT")
+    if [[ -n $nonce && $nonce == "$live" && $unit_state == active && $unit_pid =~ ^[1-9][0-9]*$ ]] &&
+      grep -qx -- "$unit_pid" <<<"$serving"; then
       verified=1
       break
     fi
@@ -302,6 +324,19 @@ if [[ $ENGINE == v3 ]]; then
     # than leave the shell guard routing at a proxy we could not confirm.
     rm -f "$UNIT_DIR/prefix-proxy.settings"
     echo "ERROR: proxy nonce verification failed; cache-warmer.timer remains stopped; re-run ./install.sh" >&2
+    # What was observed, never the nonce itself: it is a credential for the route.
+    nonce_word=absent
+    [[ -z $nonce ]] || nonce_word=present
+    live_word=none
+    if [[ -n $live && $live == "$nonce" ]]; then
+      live_word=matches
+    elif [[ -n $live ]]; then
+      live_word=differs
+    fi
+    echo "       prefix-proxy.service is ${unit_state:-unknown} (MainPID ${unit_pid:-unknown}); 127.0.0.1:$PROXY_PORT is held by pid ${serving:+${serving//$'\n'/,}}${serving:-none this user owns}; nonce file $nonce_word, live answer $live_word" >&2
+    if [[ -n $serving ]] && ! grep -qx -- "$unit_pid" <<<"$serving"; then
+      echo "       A proxy started outside systemd holds the port, so the service could not bind and nothing it runs was verified. Stop that process, then re-run ./install.sh." >&2
+    fi
     exit 1
   fi
   printf '%s\n' "$fingerprint" > "$UNIT_DIR/prefix-proxy.applied"

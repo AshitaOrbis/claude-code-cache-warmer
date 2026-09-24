@@ -1,5 +1,46 @@
 # Changelog
 
+## Unreleased — proxy arguments (bq-1971)
+
+- **The proxy used a flag name as its capture directory.** `prefix-proxy.js`
+  read its two positionals blind: whatever sat in the second slot was the
+  capture store. `node prefix-proxy.js 8377 --logdir` therefore created a
+  directory literally named `--logdir` in the current directory, wrote a health
+  nonce into it and served from it, silently overriding `CW_CAPTURE_DIR`.
+  `--help` ran the whole startup — store created, nonce written, retention
+  sweep — and only then died on a `NaN` port. Arguments are now parsed and
+  validated before the first filesystem call: `[port] [logdir]` still works
+  exactly as the installed unit uses it, `--port N`, `--logdir DIR` and
+  `-h`/`--help` are recognised, the port must be an integer 0-65535, and
+  anything else that begins with `-` is a usage error (exit 2) that writes
+  nothing. A directory that really does begin with `-` is still reachable as
+  `--logdir=-name`, `./-name`, or after a bare `--`.
+- **A start that failed could unseat the proxy that was running.** The health
+  nonce was written before `listen()`. A second `node prefix-proxy.js` against
+  a store already being served — the port busy, or a mistyped argument —
+  replaced the running proxy's `.health-nonce` and then exited, after which the
+  shell guard compared the live proxy's answer with a nonce it had never
+  issued, read it as a squatter, and withdrew the route from every new shell
+  until the proxy was restarted. Fail-closed, but silent: nothing was captured
+  and nothing said why. The nonce is now written only once the port is held,
+  and a failed bind exits 1 and says so instead of throwing. The retention sweep
+  still runs before the bind on purpose, so a proxy that cannot get its port
+  keeps enforcing retention on every restart attempt. Not covered: the nonce
+  belongs to the store, not the port, so a second proxy that *successfully*
+  binds a different port against the same store still replaces it. One store,
+  one proxy.
+- **A service start that never bound could still pass installation.** Once the
+  nonce was written only after the bind, a start that lost the port to a proxy
+  launched by hand no longer disturbed that proxy's nonce — and the installer's
+  verification, which compared only the nonce on disk with the answer on the
+  port, took the hand-launched proxy's answer for its own service's, recorded
+  the new code's fingerprint and reported a successful install while the unit
+  crash-looped on `EADDRINUSE` (review of record, 2026-09-20). Verification now
+  also requires `prefix-proxy.service` to be active and its `MainPID` to be the
+  process `ss` shows holding `127.0.0.1:<port>`; anything else fails, names the
+  pid that holds the port, and withdraws the settings record as before. `ss`
+  (iproute2) joins the v3 dependencies. The nonce is never printed.
+
 ## Unreleased — GPT Pro review follow-up (bq-2558, bq-2559)
 
 - **Switching to v2 left the capture proxy running.** A v2 install removed

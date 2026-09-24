@@ -629,6 +629,79 @@ assert_eq "and install.sh bakes it into the warmer unit" "yes" \
   "$(render_warmer_service /bin/bash /opt/cw/replay-warmer.sh /usr/bin v3 /home/u/.cache/prefix-proxy \
      | grep -qF 'Environment="CW_CAPTURE_DIR=/home/u/.cache/prefix-proxy"' && echo yes || echo no)"
 
+# ---------------------------------------------------------------------------
+# bq-1971 — argv[3] was the capture store whatever it said. On 2026-08-23
+# `node prefix-proxy.js <port> --logdir` created a directory literally named
+# `--logdir` in the repo root, wrote a health nonce into it and served out of
+# it, silently overriding CW_CAPTURE_DIR. `--help` was worse: a NaN port only
+# failed at listen(), AFTER the default store had been created and its nonce
+# rewritten. Every case below runs the real CLI entry point from a scratch cwd
+# with a scratch HOME and a scratch CW_CAPTURE_DIR, so that on a regression the
+# stray directory lands in $WORK — and then counts what was written.
+# ---------------------------------------------------------------------------
+describe "bq-1971 proxy argv: a flag is never a directory"
+A="$WORK/argv"
+mkdir -p "$A/cwd" "$A/home"
+# Port 0 on every call that can carry one, never 8377 and never the default: if
+# the parser regresses the proxy STARTS, and it must not collide with (or be
+# mistaken for) a real proxy on this box. `timeout` bounds that case; a usage
+# error exits long before it.
+proxy_cli() {
+  (cd "$A/cwd" && HOME="$A/home" CW_CAPTURE_DIR="$A/env-store" \
+    timeout 5 node "$REPO_DIR/prefix-proxy.js" "$@")
+}
+# Everything under $A except the two directories made above. The store is NOT
+# named as a start point: `find "$A/env-store" -mindepth 1` cannot see an EMPTY
+# env-store, and an empty store is exactly what "ensureStore ran before argv was
+# judged" leaves behind.
+written() { find "$A" -mindepth 1 ! -path "$A/cwd" ! -path "$A/home" | wc -l | tr -d ' '; }
+assert_status "'<port> --logdir' — the 2026-08-23 invocation — is a usage error" 2 proxy_cli 0 --logdir
+assert_eq "and no directory named --logdir was created" "no" \
+  "$([[ -e "$A/cwd/--logdir" ]] && echo yes || echo no)"
+assert_status "a short flag in the logdir slot is refused too" 2 proxy_cli 0 -x
+assert_status "an unknown long option is refused" 2 proxy_cli 0 --verbose
+assert_status "--logdir with another flag as its value is refused" 2 proxy_cli 0 --logdir --help
+assert_status "--port without a number is refused" 2 proxy_cli --port --logdir "$A/store"
+assert_status "a non-numeric port is refused before startup, not at listen()" 2 proxy_cli 0abc
+assert_status "a port above 65535 is refused" 2 proxy_cli 65536
+assert_status "a third positional is refused" 2 proxy_cli 0 "$A/store" extra
+assert_status "a setting given by position AND by flag is refused" 2 proxy_cli 0 "$A/store" --logdir "$A/other"
+assert_status "a flag given twice is refused" 2 proxy_cli --port 0 --port 0
+assert_status "--logdir= with nothing after it is refused" 2 proxy_cli 0 --logdir=
+assert_status "--help exits 0" 0 proxy_cli 0 --help
+# Captured first, matched second: `proxy_cli … | grep -q` under pipefail would
+# report the CLI's own exit 2 as "no match".
+help_out=$(proxy_cli 0 -h 2>/dev/null || true)
+assert_eq "--help prints the usage text on stdout" "yes" \
+  "$([[ $help_out == "Usage: node prefix-proxy.js"* ]] && echo yes || echo no)"
+usage_err=$(proxy_cli 0 --logdir 2>&1 >/dev/null || true)
+assert_eq "a usage error names what was wrong, on stderr" "yes" \
+  "$([[ $usage_err == *"--logdir needs a value"* ]] && echo yes || echo no)"
+assert_eq "NOTHING was written by any of the above — no cwd entry, no default store, no env store" "0" "$(written)"
+
+describe "bq-1971 proxy argv: the forms that worked keep working"
+parse() { node -e '
+  const p = require(process.argv[1]);
+  const argv = ["node", "p.js", ...JSON.parse(process.argv[2])];
+  const o = p.parseArgs(argv);
+  console.log([o.port, p.resolveLogdir(argv, {CW_CAPTURE_DIR: "/env"})].join(" "));
+' "$REPO_DIR/prefix-proxy.js" "$1"; }
+assert_eq "the installed unit's ExecStart form: <port> <logdir>" "8377 /home/u/.cache/prefix-proxy" \
+  "$(parse '["8377","/home/u/.cache/prefix-proxy"]')"
+assert_eq "no arguments: default port, CW_CAPTURE_DIR" "8377 /env" "$(parse '[]')"
+assert_eq "an empty positional logdir still means 'not given'" "8377 /env" "$(parse '["8377",""]')"
+assert_eq "named flags, either order" "9000 /d" "$(parse '["--logdir","/d","--port","9000"]')"
+assert_eq "--name=value" "9000 /d" "$(parse '["--port=9000","--logdir=/d"]')"
+assert_eq "a logdir that really starts with '-' is reachable via --logdir=" "8377 -odd" \
+  "$(parse '["--logdir=-odd"]')"
+assert_eq "and after a bare --" "8377 -odd" "$(parse '["--","8377","-odd"]')"
+assert_eq "resolveLogdir itself now throws on the 2026-08-23 argv" "UsageError" \
+  "$(node -e '
+    const p = require(process.argv[1]);
+    try { p.resolveLogdir(["node", "p.js", "8377", "--logdir"], {}); console.log("accepted"); }
+    catch (e) { console.log(e instanceof p.UsageError ? "UsageError" : "other"); }
+  ' "$REPO_DIR/prefix-proxy.js")"
+
 describe "bq-318 proxy startup: an unwritable store is fatal, not silent"
 RO="$WORK/readonly-store"
 mkdir -p "$RO"
@@ -817,6 +890,43 @@ assert_eq "a squatter answering 200 with the wrong body -> unset" "unset" \
 kill "$SQUAT" 2>/dev/null || true
 else
   describe "sol-2 squatter loopback fixture: SKIPPED by CW_SKIP_LOOPBACK_TESTS=1"
+fi
+
+# The nonce was written BEFORE listen(), so a start that never got the port —
+# busy port, or (before bq-1971) a typo'd flag — still replaced the nonce of
+# the proxy that did hold it, and the REAL shell guard above then withdrew the
+# route from every new shell. Real proxy, real guard, scratch store, free port.
+if [[ ${CW_SKIP_LOOPBACK_TESTS:-0} != 1 ]]; then
+describe "proxy nonce: a start that never gets the port must not unseat the proxy that has it"
+NS="$WORK/nonce-owner"
+mkdir -p "$NS/home"
+NPORT=$(node -e 'const s = require("net").createServer().listen(0, "127.0.0.1", () => { console.log(s.address().port); s.close(); });')
+# Bounded: if the suite dies between here and the kill below, the EXIT trap
+# only removes $WORK and this proxy would otherwise outlive the run.
+HOME="$NS/home" timeout 60 node "$REPO_DIR/prefix-proxy.js" "$NPORT" "$NS/store" > "$NS/first.log" 2>&1 &
+FIRST=$!
+for _ in $(seq 1 100); do grep -q 'listening on' "$NS/first.log" 2>/dev/null && break; sleep 0.05; done
+assert_eq "the guard routes to the running proxy (positive control)" "http://127.0.0.1:$NPORT" \
+  "$(guard "$NPORT" "$NS/store")"
+# `|| echo` on both reads: a bare failing assignment under `set -e` would end
+# the suite with no tally if the first start lost its port to something else
+# between the picker and the bind — the control above already reports that.
+nonce_id() { sha256sum "$NS/store/.health-nonce" 2>/dev/null || echo missing; }
+before=$(nonce_id)
+assert_status "a second start on the same port and store exits 1" 1 \
+  env HOME="$NS/home" timeout 5 node "$REPO_DIR/prefix-proxy.js" "$NPORT" "$NS/store"
+assert_eq "the running proxy's nonce file exists (control for the next line)" "no" \
+  "$([[ $before == missing ]] && echo yes || echo no)"
+assert_eq "and the failed start leaves it alone" "$before" "$(nonce_id)"
+assert_eq "so the guard STILL routes to the running proxy" "http://127.0.0.1:$NPORT" \
+  "$(guard "$NPORT" "$NS/store")"
+second_err=$(HOME="$NS/home" timeout 5 node "$REPO_DIR/prefix-proxy.js" "$NPORT" "$NS/store" 2>&1 >/dev/null || true)
+assert_eq "the failure says why, without a stack trace" "yes" \
+  "$([[ $second_err == *"cannot listen on 127.0.0.1:$NPORT"* && $second_err != *"    at "* ]] && echo yes || echo no)"
+kill "$FIRST" 2>/dev/null || true
+wait "$FIRST" 2>/dev/null || true
+else
+  describe "proxy nonce ownership loopback fixture: SKIPPED by CW_SKIP_LOOPBACK_TESTS=1"
 fi
 
 describe "sol-3 proxy: an upstream stream error must not be an uncaught exception"

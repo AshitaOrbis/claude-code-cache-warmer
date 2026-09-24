@@ -30,7 +30,15 @@
 // request, write failures are logged rather than swallowed, and health carries
 // capture state.
 //
+// Arguments (bq-1971): the two positionals used to be read blind — argv[3] was
+// the capture store whatever it said, so `node prefix-proxy.js 8377 --logdir`
+// created a directory literally named `--logdir` and served out of it, and
+// `--help` ran the whole startup (store, nonce, sweep) before dying on a NaN
+// port. argv is now parsed and validated BEFORE any filesystem operation, and
+// anything flag-shaped that is not a known flag is a usage error (exit 2).
+//
 // Usage: node prefix-proxy.js [port] [logdir]
+//        node prefix-proxy.js [--port N] [--logdir DIR]
 //   CW_CAPTURE_DIR  capture store (same knob replay-warmer.sh reads)
 //   CW_PRUNE_HOURS  capture retention window (default 6, matches config)
 'use strict';
@@ -41,6 +49,7 @@ const path = require('path');
 const crypto = require('crypto');
 const os = require('os');
 
+const DEFAULT_PORT = 8377;
 const DEFAULT_PRUNE_HOURS = 6;
 const PRUNE_INTERVAL_MS = 10 * 60 * 1000;
 // Both the promoted (`req-`) and the crash-leftover (`pending-`) prefixes.
@@ -169,9 +178,87 @@ function defaultLogdir() {
   return path.join(os.homedir(), '.cache', 'prefix-proxy');
 }
 
+const USAGE = `Usage: node prefix-proxy.js [port] [logdir]
+       node prefix-proxy.js [--port N] [--logdir DIR]
+
+  port      TCP port on 127.0.0.1 (default ${DEFAULT_PORT})
+  logdir    capture store (default: $CW_CAPTURE_DIR, else ~/.cache/prefix-proxy)
+  -h, --help
+
+A logdir that really does begin with '-' must be written so it cannot be read
+as an option: --logdir=-name, ./-name, or after a bare '--'.`;
+
+class UsageError extends Error {}
+
+function parsePort(raw) {
+  // Digits only: Number() would also take '0x20', '1e3' and ' 80 ', and turn
+  // '--port' into a NaN that only failed at listen() — after the store had
+  // been created and the nonce written.
+  if (!/^[0-9]{1,5}$/.test(raw) || Number(raw) > 65535) {
+    throw new UsageError(`port must be an integer 0-65535 (got '${raw}')`);
+  }
+  return Number(raw);
+}
+
+// argv -> { port, logdir, help }. `logdir` is undefined when not given, so the
+// caller can fall through to CW_CAPTURE_DIR. Throws UsageError; touches nothing.
+function parseArgs(argv) {
+  const args = argv.slice(2);
+  const named = {};
+  const positional = [];
+  let help = false;
+  let optionsEnded = false;
+  for (let i = 0; i < args.length; i += 1) {
+    const arg = args[i];
+    if (optionsEnded) { positional.push(arg); continue; }
+    if (arg === '--') { optionsEnded = true; continue; }
+    if (arg === '-h' || arg === '--help') { help = true; continue; }
+    const m = /^--(port|logdir)(?:=([\s\S]*))?$/.exec(arg);
+    if (m) {
+      const name = m[1];
+      let value = m[2];
+      if (value === undefined) {
+        value = args[i + 1];
+        // The 2026-08-23 invocation exactly: a flag with nothing after it.
+        if (value === undefined || value.startsWith('-')) {
+          throw new UsageError(`--${name} needs a value`);
+        }
+        i += 1;
+      }
+      if (value === '') throw new UsageError(`--${name} needs a value`);
+      if (name in named) throw new UsageError(`--${name} given more than once`);
+      named[name] = value;
+      continue;
+    }
+    if (arg.startsWith('-')) throw new UsageError(`unknown option '${arg}'`);
+    positional.push(arg);
+  }
+  if (positional.length > 2) {
+    throw new UsageError(`unexpected argument '${positional[2]}'`);
+  }
+  // An EMPTY positional keeps its old meaning — "not given" — so a unit file
+  // that renders an unset value as "" still falls through to the defaults.
+  const [posPort, posLogdir] = positional;
+  // Positionals are [port] [logdir] in that order even beside a named flag, so
+  // `--port 9000 /d` lands here with '/d' in the port slot; naming the value is
+  // what makes that message legible.
+  if (posPort && named.port !== undefined) {
+    throw new UsageError(`port given both by position ('${posPort}') and by --port — positionals are [port] [logdir], in that order`);
+  }
+  if (posLogdir && named.logdir !== undefined) {
+    throw new UsageError(`logdir given both by position ('${posLogdir}') and by --logdir`);
+  }
+  const rawPort = named.port !== undefined ? named.port : posPort;
+  return {
+    help,
+    port: rawPort ? parsePort(rawPort) : DEFAULT_PORT,
+    logdir: (named.logdir !== undefined ? named.logdir : posLogdir) || undefined,
+  };
+}
+
 // One resolution order, mirrored by replay-warmer.sh's CAP_DIR.
 function resolveLogdir(argv, env) {
-  return argv[3] || env.CW_CAPTURE_DIR || defaultLogdir();
+  return parseArgs(argv).logdir || env.CW_CAPTURE_DIR || defaultLogdir();
 }
 
 function pruneHours(env) {
@@ -380,7 +467,21 @@ function createProxyServer(logdir, nonce, state = newHealthState()) {
 }
 
 function main(argv, env) {
-  const port = Number(argv[2] || 8377);
+  // Everything about argv is settled here, before the first filesystem call.
+  let opts;
+  try {
+    opts = parseArgs(argv);
+  } catch (e) {
+    if (!(e instanceof UsageError)) throw e;
+    console.error(`prefix-proxy: ${e.message}`);
+    console.error(USAGE);
+    process.exit(2);
+  }
+  if (opts.help) {
+    console.log(USAGE);
+    process.exit(0);
+  }
+  const port = opts.port;
   const logdir = resolveLogdir(argv, env);
   const maxAgeMs = pruneHours(env) * 3600 * 1000;
 
@@ -392,7 +493,6 @@ function main(argv, env) {
     process.exit(1);
   }
   const nonce = crypto.randomBytes(16).toString('hex');
-  fs.writeFileSync(path.join(logdir, '.health-nonce'), nonce, { mode: 0o600 });
   const state = newHealthState();
 
   // Retention runs here, in the always-on component, and is deliberately
@@ -401,13 +501,44 @@ function main(argv, env) {
   sweep();
   setInterval(sweep, PRUNE_INTERVAL_MS);
 
-  createProxyServer(logdir, nonce, state).listen(port, '127.0.0.1', () => {
+  // The nonce file says "the proxy serving this store is THIS process", so a
+  // process that never got a port has no business writing it. It used to be
+  // written before listen(): a second start against a store already being
+  // served — a busy port, or a typo'd argument — replaced the running proxy's
+  // nonce and then died, and from that moment the shell guard saw a squatter
+  // and withdrew the route from every new shell until the real proxy was
+  // restarted.
+  //
+  // What this does NOT cover: the nonce is keyed by STORE, not by port. A
+  // second proxy that successfully binds a DIFFERENT port against the same
+  // store still replaces it, and the first proxy is unseated just the same.
+  // Refusing that start needs the store to record its owner's port — a
+  // change to the contract with shell-guard.sh and install.sh, not to this
+  // ordering. One store, one proxy.
+  // (The retention sweep above stays BEFORE listen on purpose: under
+  // Restart=always a proxy that cannot bind still enforces retention on every
+  // attempt, and bq-314 made retention independent of everything else.)
+  const server = createProxyServer(logdir, nonce, state);
+  const onListenError = (e) => {
+    console.error(`prefix-proxy: cannot listen on 127.0.0.1:${port}: ${e.message} — the health nonce was not rewritten, so a proxy already serving this store keeps its route.`);
+    process.exit(1);
+  };
+  server.once('error', onListenError);
+  server.listen(port, '127.0.0.1', () => {
+    server.removeListener('error', onListenError);
+    try {
+      fs.writeFileSync(path.join(logdir, '.health-nonce'), nonce, { mode: 0o600 });
+    } catch (e) {
+      // Up without a nonce on disk is a proxy the guard can never verify.
+      console.error(`prefix-proxy: cannot write the health nonce in ${logdir}: ${e.message}`);
+      process.exit(1);
+    }
     console.log(`prefix-proxy listening on 127.0.0.1:${port} -> api.anthropic.com, logging to ${logdir}`);
   });
 }
 
 module.exports = {
-  defaultLogdir, resolveLogdir, pruneHours, ensureStore, storeWritable,
+  defaultLogdir, resolveLogdir, parseArgs, UsageError, pruneHours, ensureStore, storeWritable,
   sanitizeCaptureHeaders, bodyHasHostedMcpAuthorizationToken, persistPendingCapture,
   pruneCaptures, createRetentionSweep, createProxyServer, newHealthState,
   healthReport, CAPTURE_RE,
