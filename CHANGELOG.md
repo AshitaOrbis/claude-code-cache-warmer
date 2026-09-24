@@ -29,6 +29,17 @@
   belongs to the store, not the port, so a second proxy that *successfully*
   binds a different port against the same store still replaces it. One store,
   one proxy.
+- **A service start that never bound could still pass installation.** Once the
+  nonce was written only after the bind, a start that lost the port to a proxy
+  launched by hand no longer disturbed that proxy's nonce — and the installer's
+  verification, which compared only the nonce on disk with the answer on the
+  port, took the hand-launched proxy's answer for its own service's, recorded
+  the new code's fingerprint and reported a successful install while the unit
+  crash-looped on `EADDRINUSE` (review of record, 2026-09-20). Verification now
+  also requires `prefix-proxy.service` to be active and its `MainPID` to be the
+  process `ss` shows holding `127.0.0.1:<port>`; anything else fails, names the
+  pid that holds the port, and withdraws the settings record as before. `ss`
+  (iproute2) joins the v3 dependencies. The nonce is never printed.
 
 ## Unreleased — GPT Pro review follow-up (bq-2558, bq-2559)
 

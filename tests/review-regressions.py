@@ -39,12 +39,36 @@ class Review(unittest.TestCase):
 if [[ $* == *daemon-reload* && ${FAIL_RELOAD:-0} == 1 ]]; then echo "mock reload failure" >&2; exit 1; fi
 if [[ $* == *'enable prefix-proxy.service'* && ${FAIL_ENABLE:-0} == 1 ]]; then echo "mock enable failure" >&2; exit 1; fi
 if [[ $* == *is-active* ]]; then [[ -f "$HOME/active" ]]; exit; fi
+# What the installer asks about the unit it just started (bq-1971 review fold): a
+# unit is "active" with a MainPID while its process lives. UNIT_STATE / UNIT_PID
+# model a start that lost the port to a proxy launched by hand; UNIT_PID set but
+# empty models a systemctl that answers nothing.
+if [[ $* == *'show -p ActiveState'* ]]; then
+  if [[ -n ${UNIT_STATE:-} ]]; then echo "$UNIT_STATE"; elif [[ -f "$HOME/active" ]]; then echo active; else echo inactive; fi
+  exit 0
+fi
+if [[ $* == *'show -p MainPID'* ]]; then
+  if [[ -n ${UNIT_PID+set} ]]; then echo "$UNIT_PID"; elif [[ -f "$HOME/active" ]]; then echo 4242; else echo 0; fi
+  exit 0
+fi
 if [[ $* == *'restart prefix-proxy.service'* || $* == *'enable --now prefix-proxy.service'* ]]; then
-  mkdir -p "$NONCE_DIR"; echo nonce > "$NONCE_DIR/.health-nonce"; touch "$HOME/active"
+  mkdir -p "$NONCE_DIR"; touch "$HOME/active"
+  # A start that never bound writes no nonce (0002); START_KEEPS_NONCE=1 models it.
+  [[ ${START_KEEPS_NONCE:-0} == 1 ]] || echo nonce > "$NONCE_DIR/.health-nonce"
 fi
 # Starting the proxy sets the one marker, so stopping the proxy clears it (bq-2558).
 if [[ $* == *'disable --now prefix-proxy.service'* || $* == *'stop prefix-proxy.service'* ]]; then rm -f "$HOME/active"; fi''')
         self.fake('curl', 'echo probe >> "$CALLS"; [[ ${BAD_HEALTH:-0} == 0 ]] && echo nonce || echo wrong')
+        # The line is a real `ss -H -ltnp 'sport = :PORT'` line (captured 2026-09-24); only the
+        # port and the pid vary. SERVING_PID names the process holding the port — by default the
+        # unit's own, as a healthy start leaves it. SS_NO_OWNER=1 prints the line without an
+        # owner, which is what ss shows for a socket another user holds.
+        self.fake('ss', '''echo "ss $*" >> "$CALLS"
+args="$*"
+port=${args##*:}
+pid=${SERVING_PID:-${UNIT_PID:-4242}}
+line="LISTEN 0      511    127.0.0.1:${port} 0.0.0.0:*"
+if [[ ${SS_NO_OWNER:-0} == 1 ]]; then printf '%s\\n' "$line"; else printf '%s users:(("MainThread",pid=%s,fd=21))\\n' "$line" "$pid"; fi''')
 
     def fake(self, name, body):
         p = self.bin / name
@@ -411,6 +435,10 @@ start() {
 }
 case $cmd in
   is-active) [[ -f $state/$unit.active ]] ;;
+  show)
+    if [[ $* == *ActiveState* ]]; then
+      if [[ -f $state/$unit.active ]]; then echo active; else echo inactive; fi
+    elif [[ -f $state/$unit.active ]]; then echo 4242; else echo 0; fi ;;
   is-enabled) if [[ -f $state/$unit.enabled ]]; then echo enabled; else echo disabled; exit 1; fi ;;
   enable) touch "$state/$unit.enabled"; if ((now)); then start; fi ;;
   disable)
@@ -578,6 +606,90 @@ esac''')
         self.assertIn(override, (units / 'prefix-proxy.service').read_text())
         self.config('PROXY_PORT=""\n')
         self.assertEqual(self.install().returncode, 2)
+
+    def test_bq_1971_a_service_that_never_bound_cannot_pass_verification(self):
+        """bq-1971 review fold: verification binds the answering proxy to the unit's own process"""
+        units = self.home / '.config/systemd/user'
+        calls = self.base / 'calls'
+        nonce = self.home / 'captures' / '.health-nonce'
+        curl_default = 'echo probe >> "$CALLS"; echo nonce'
+        self.config()
+        # Control: a healthy start is verified against the pid that holds the port.
+        r = self.install()
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn('ss -H -ltnp sport = :8377', calls.read_text())
+        self.assertTrue((units / 'prefix-proxy.applied').exists())
+
+        # A proxy launched by hand holds the port and the store. The unit's start fails
+        # with EADDRINUSE and writes no nonce (0002); the hand-launched proxy keeps
+        # answering the nonce that IS on disk. Before this fold the installer took that
+        # answer for its own service's and published the new code's fingerprint.
+        def stale_proxy_holds_the_port(**unit):
+            nonce.write_text('fixture-nonce-9f3a')            # the hand-launched proxy's
+            self.fake('curl', 'echo probe >> "$CALLS"; echo fixture-nonce-9f3a')
+            calls.write_text('')
+            r = self.install(START_KEEPS_NONCE='1', SERVING_PID='555', **unit)
+            self.fake('curl', curl_default)
+            self.assertNotEqual(r.returncode, 0, r.stdout)
+            self.assertNotIn('v3 installed', r.stdout)
+            self.assertFalse((units / 'prefix-proxy.applied').exists(), 'a start that never bound was certified')
+            self.assertFalse((units / 'prefix-proxy.settings').exists(), 'unverified settings were published')
+            self.assertIn('outside systemd', r.stderr)
+            self.assertIn('pid 555', r.stderr)
+            self.assertNotIn('9f3a', r.stderr)                # the nonce is a credential: never printed
+            return r
+
+        cases = (('crash-looping unit', dict(UNIT_STATE='activating', UNIT_PID='0'), True),
+                 ('unit caught in its brief active window', dict(UNIT_STATE='active', UNIT_PID='777'), True),
+                 ('no restart because the fingerprint matches', dict(UNIT_STATE='active', UNIT_PID='777'), False))
+        for name, unit, changed in cases:
+            with self.subTest(case=name):
+                self.assertEqual(self.install().returncode, 0)    # a verified baseline each time
+                if changed:
+                    with (self.repo / 'prefix-proxy.js').open('a') as stream:
+                        stream.write(f'\n// fixture change: {name}\n')
+                stale_proxy_holds_the_port(**unit)
+                self.assertEqual('restart prefix-proxy.service' in calls.read_text(), changed)
+        # A first install onto a host where such a proxy is already running.
+        with self.subTest(case='fresh install, port already held'):
+            self.assertEqual(self.install().returncode, 0)
+            (self.home / 'active').unlink()
+            (units / 'prefix-proxy.applied').unlink()
+            stale_proxy_holds_the_port(UNIT_STATE='activating', UNIT_PID='0')
+            self.assertIn('enable --now prefix-proxy.service', calls.read_text())
+        # A listener ss cannot attribute to this user is not one this installer verified.
+        with self.subTest(case='the port answers but no process of this user holds it'):
+            self.assertEqual(self.install().returncode, 0)
+            self.config('PRUNE_HOURS=2\n')
+            r = self.install(SS_NO_OWNER='1')
+            self.assertNotEqual(r.returncode, 0, r.stdout)
+            self.assertIn('none this user owns', r.stderr)
+            self.assertNotIn('outside systemd', r.stderr)     # nothing to name, so no claim
+            self.assertFalse((units / 'prefix-proxy.applied').exists())
+        # The unit's own process still answers while the unit is on its way down (a stop
+        # racing this install): the pid matches, the state does not, and a fingerprint
+        # recorded now would describe a proxy that is gone a moment later.
+        with self.subTest(case='unit stopping while its process still answers'):
+            self.assertEqual(self.install().returncode, 0)
+            r = self.install(UNIT_STATE='deactivating')
+            self.assertNotEqual(r.returncode, 0, r.stdout)
+            self.assertIn('is deactivating', r.stderr)
+            self.assertNotIn('outside systemd', r.stderr)     # the pid IS the unit's
+            self.assertFalse((units / 'prefix-proxy.applied').exists())
+        # systemctl that answers nothing (no bus, as in a sandbox) beside a listener ss
+        # cannot attribute: an empty MainPID must not match the empty here-string.
+        with self.subTest(case='systemctl answers nothing and ss shows no owner'):
+            self.assertEqual(self.install().returncode, 0)
+            r = self.install(UNIT_PID='', SS_NO_OWNER='1')
+            self.assertNotEqual(r.returncode, 0, r.stdout)
+            self.assertIn('MainPID unknown', r.stderr)
+            self.assertFalse((units / 'prefix-proxy.applied').exists())
+        # And the restored healthy state verifies again, restarting as usual.
+        self.config()
+        calls.write_text('')
+        r = self.install()
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn('restart prefix-proxy.service', calls.read_text())
 
 
 if __name__ == '__main__':
